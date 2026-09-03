@@ -64,16 +64,56 @@ VM notes:
   • If the run is interrupted, re-running resumes cleanly: parquet_chunks/
     is overwritten, the script doesn't track per-chunk resumption (start
     over if interrupted mid-run).
+  • IPv6 is force-disabled at import time.  Some Linux VM providers ship
+    without IPv6; HF Hub's HTTP client otherwise retries forever with
+    [Errno 97] "Address family not supported by protocol".  The patch is
+    a no-op on hosts that have working IPv4 only.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# IPv4-only DNS (must run before huggingface_hub / urllib3 imports)
+# ---------------------------------------------------------------------------
+def _force_ipv4() -> None:
+    """Coerce socket.getaddrinfo() to return only IPv4 results.
+
+    Some Linux VM providers ship without IPv6.  The HF Hub HTTP client
+    (httpx + urllib3) tries AAAA records first; when AAAA returns
+    "[Errno 97] Address family not supported by protocol" it retries
+    with backoff and eventually gives up.  Filtering out non-AF_INET
+    entries up front makes every downstream call IPv4-only.
+
+    Idempotent: re-applying replaces the same module attribute.  No-op
+    on hosts where IPv4 works (all results are AF_INET already).
+    """
+    _orig = socket.getaddrinfo
+
+    def _patched(host, *args, **kwargs):
+        try:
+            results = _orig(host, *args, **kwargs)
+        except socket.gaierror:
+            raise
+        v4 = [r for r in results if r[0] == socket.AF_INET]
+        if v4:
+            return v4
+        # Fall back to original list; will raise a normal DNS error if
+        # nothing is reachable.  Better than silently dropping all results.
+        return results
+
+    socket.getaddrinfo = _patched
+
+
+_force_ipv4()
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
