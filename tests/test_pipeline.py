@@ -116,9 +116,12 @@ class TestSFTStage:
         sched = WarmupCosineLR(opt, AdamWConfig(lr=1e-4, max_steps=10))
 
         logits = model(batch["input_ids"])
+        # C1: shift logits so logits[t] predicts labels[t+1] (standard causal LM).
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = batch["labels"][:, 1:].contiguous()
         loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            batch["labels"].reshape(-1),
+            shift_logits.reshape(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
             ignore_index=-100,
         )
         assert torch.isfinite(loss).item()

@@ -71,7 +71,7 @@ class ModelConfig:
     ctx_len: int = 4096               # Training context
 
     # FFN
-    ffn_mult: int = 4                 # dim_ffn = d_model * ffn_mult
+    ffn_mult: float = 4.0    # dim_ffn = d_model * ffn_mult; config.yaml overrides to 2.75
 
     # LoRA dims (canonical RWKV-7 values)
     d_decay_lora: int = 64
@@ -88,6 +88,15 @@ class ModelConfig:
     dtype: torch.dtype = torch.float32  # CPU test default; train with bf16
 
     def __post_init__(self) -> None:
+        # C3 fix: reject non-numeric ffn_mult rather than silently producing
+        # wrong dim_ffn (e.g. YAML string or None previously coerced to None).
+        if not isinstance(self.ffn_mult, (int, float)) or isinstance(self.ffn_mult, bool):
+            raise TypeError(
+                f"ffn_mult must be int or float, got {type(self.ffn_mult).__name__}: "
+                f"{self.ffn_mult!r}"
+            )
+        # Normalize to float so dim_ffn arithmetic is consistent.
+        self.ffn_mult = float(self.ffn_mult)
         if self.n_heads is None:
             assert self.d_model % self.d_state == 0, (
                 f"d_model ({self.d_model}) must be divisible by d_state ({self.d_state})"
@@ -100,7 +109,9 @@ class ModelConfig:
 
     @property
     def dim_ffn(self) -> int:
-        return self.d_model * self.ffn_mult
+        # C3 fix: cast to int so PyTorch layer dims (nn.Linear, etc.) always get
+        # an integer.  With ffn_mult=float the product is float by default.
+        return int(self.d_model * self.ffn_mult)
 
     @property
     def head_size(self) -> int:

@@ -116,6 +116,11 @@ class ParquetDataset:
         # Optional: hold out the last `val_frac` of each source for validation
         val_frac: float = 0.0,
         train: bool = True,
+        # M1 fix: tokenizer EOS id, used to mark doc boundaries so the model
+        # learns to predict EOS at end-of-document. Falls back to 0 (with a
+        # one-shot warning) for backward compat — call sites should pass the
+        # tokenizer's `eos_id`.
+        eos_id: Optional[int] = None,
     ):
         self.repo_id = repo_id
         self.token = token or _get_hf_token()
@@ -124,6 +129,12 @@ class ParquetDataset:
         self.sources_filter = sources_filter  # None = include all
         self.val_frac = val_frac
         self.train = train
+        self.eos_id = eos_id
+        self._warned_eos_fallback = False
+
+        # H3 fix: cache the full pyarrow Table per shard so we never
+        # re-open the parquet file.  Maps shard index -> (table, path_mtime).
+        self._table_cache: Dict[int, Tuple[Any, float]] = {}
 
         # State (filled by .load())
         self.shards: List[ParquetShard] = []
@@ -214,13 +225,35 @@ class ParquetDataset:
     # Iteration
     # ------------------------------------------------------------------
 
-    def _read_row(self, shard: ParquetShard, row_idx: int) -> Tuple[List[int], str]:
-        """Read one row from a parquet shard; return (tokens, source)."""
-        # Use row-group reads if possible to avoid loading whole file
+    def _ensure_table_loaded(self, shard_idx: int) -> Any:
+        """Load (or return cached) pyarrow Table for a shard.
+
+        H3 fix: we open each parquet file exactly once per dataset lifetime.
+        The table is cached for all subsequent row reads.
+        """
+        import time as _time
+
+        shard = self.shards[shard_idx]
+        if shard_idx in self._table_cache:
+            cached_table, cached_mtime = self._table_cache[shard_idx]
+            # Re-check mtime to handle updated files (e.g. re-downloaded)
+            current_mtime = shard.local_path.stat().st_mtime
+            if cached_mtime == current_mtime:
+                return cached_table
+            # File changed; reload
+            del self._table_cache[shard_idx]
+
         pf = pq.ParquetFile(str(shard.local_path))
-        table = pf.read(columns=["source", "tokens"], indices=[row_idx])
-        tokens = list(table["tokens"][0].as_py())
-        source = table["source"][0].as_py()
+        table = pf.read(columns=["source", "tokens"])
+        mtime = shard.local_path.stat().st_mtime
+        self._table_cache[shard_idx] = (table, mtime)
+        return table
+
+    def _read_row(self, shard_idx: int, row_idx: int) -> Tuple[List[int], str]:
+        """Read one row from a parquet shard; return (tokens, source)."""
+        table = self._ensure_table_loaded(shard_idx)
+        tokens = list(table["tokens"][row_idx].as_py())
+        source = table["source"][row_idx].as_py()
         return tokens, source
 
     def iter_batches(
@@ -243,11 +276,22 @@ class ParquetDataset:
             {"input_ids": LongTensor[seq_len], "labels": LongTensor[seq_len]}
             (a single packed sequence per batch; effective batch size = 1)
         """
-        # Build a flat list of (shard, row_idx) references
+        # H2 fix: build the set of (shard_idx, row_idx) pairs that belong
+        # to the validation split, then exclude them from training.
+        val_refs: set[tuple[int, int]] = set()
+        if self.val_frac > 0:
+            for s_idx, shard in enumerate(self.shards):
+                n = len(shard.doc_index)
+                k = max(1, int(n * self.val_frac))
+                for r in shard.doc_index[-k:]:
+                    val_refs.add((s_idx, r))
+
+        # Build flat list of training-only (shard, row_idx) references
         all_refs: List[Tuple[int, int]] = []
         for s_idx, shard in enumerate(self.shards):
             for r in shard.doc_index:
-                all_refs.append((s_idx, r))
+                if (s_idx, r) not in val_refs:
+                    all_refs.append((s_idx, r))
 
         if deterministic:
             print(f"[ParquetDataset] Sequential iteration over "
@@ -266,17 +310,23 @@ class ParquetDataset:
         for ref_pos in order:
             shard_idx, row_idx = all_refs[ref_pos]
             try:
-                tokens, _source = self._read_row(
-                    self.shards[shard_idx], row_idx
-                )
+                tokens, _source = self._read_row(shard_idx, row_idx)
             except Exception as exc:
                 print(f"[ParquetDataset] Warn: failed to read row {row_idx} "
                       f"in {self.shards[shard_idx].local_path.name}: {exc}")
                 continue
 
             buf.extend(tokens)
-            # Also insert EOS so doc boundaries are learnable
-            buf.append(0)  # placeholder; replaced after tokenizer import
+            # Insert EOS at doc boundaries so the model learns end-of-document.
+            # M2 fix: use the threaded eos_id; fall back to 0 with a one-shot warning.
+            if self.eos_id is not None:
+                buf.append(self.eos_id)
+            else:
+                if not getattr(self, "_warned_eos_fallback", True):
+                    print("[ParquetDataset] WARN: eos_id not set; falling back to "
+                          "token 0 as doc-boundary marker. Pass eos_id=tokenizer.eos_id.")
+                    self._warned_eos_fallback = True
+                buf.append(0)
 
             # Yield full seq_len chunks
             while len(buf) >= self.seq_len:
@@ -318,9 +368,7 @@ class ParquetDataset:
 
         for shard_idx, row_idx in refs:
             try:
-                tokens, _ = self._read_row(
-                    self.shards[shard_idx], row_idx
-                )
+                tokens, _ = self._read_row(shard_idx, row_idx)
             except Exception:
                 continue
             if len(tokens) < seq_len:

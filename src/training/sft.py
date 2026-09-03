@@ -105,12 +105,19 @@ def sft_step(
     input_ids = batch["input_ids"].to(cfg.device)
     labels = batch["labels"].to(cfg.device)
 
-    logits = model(input_ids)
+    logits = model(input_ids)  # [B, T, V]
+
+    # Next-token prediction loss (C1 fix: shift to align logits[t] with labels[t+1]).
+    # Without shifting, logits[t] would be trained against labels[t] — i.e. the model
+    # would learn to predict the current token given context that includes itself,
+    # which is not autoregressive next-token prediction.
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
 
     # Loss: only on non-masked positions (labels != -100)
     loss = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        labels.reshape(-1),
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
         ignore_index=-100,
     )
 

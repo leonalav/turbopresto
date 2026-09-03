@@ -121,8 +121,11 @@ class SyntheticMathDataset:
         self._build_cache()
 
     def _build_cache(self) -> None:
+        # C2 fix: do NOT call random.seed(self.seed) — the local rng below
+        # is the correct scope. The global seed previously contaminated any
+        # other code using random.* in the same process (e.g. DataLoader
+        # workers, downstream tests).
         rng = random.Random(self.seed)
-        random.seed(self.seed)
         for _ in range(self.size):
             problem_type = rng.choice(["add", "sub", "mul", "div"])
             if problem_type == "add":

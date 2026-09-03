@@ -147,6 +147,13 @@ def collate_for_sft(batch: List[Dict], tokenizer, seq_len: int = 1024,
         all_input_ids = all_input_ids + [pad_id] * (target_len - len(all_input_ids))
         all_labels = all_labels + [-100] * (target_len - len(all_labels))
 
+    # M3 fix: assert length consistency before reshape to catch refactor bugs.
+    # Without this, a future change that breaks the lock-step extend above
+    # would silently produce misaligned tensors.
+    assert len(all_input_ids) == len(all_labels), (
+        f"input/label length drift: {len(all_input_ids)} vs {len(all_labels)}"
+    )
+
     n_chunks = target_len // seq_len
     input_ids = torch.tensor(all_input_ids[:target_len], dtype=torch.long).reshape(n_chunks, seq_len)
     labels = torch.tensor(all_labels[:target_len], dtype=torch.long).reshape(n_chunks, seq_len)

@@ -350,7 +350,8 @@ def simple_generate(
     with torch.no_grad():
         for _ in range(max_new_tokens):
             logits = model(current)  # [B, T, V]
-            logits = logits[:, -1, :]  # [B, V] — last token only
+            # H1 fix: clone so in-place masking below does not mutate model output.
+            logits = logits[:, -1, :].clone()  # [B, V]
 
             if temperature == 0:
                 next_tok = logits.argmax(dim=-1, keepdim=True)  # [B, 1]

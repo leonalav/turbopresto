@@ -77,6 +77,11 @@ class FaultlessPretrainConfig:
     resume_from: Optional[str] = None  # path to checkpoint
     max_shards: Optional[int] = None   # cap on shards loaded (debug)
 
+    # M1 fix: EOS token id, used by ParquetDataset to mark doc boundaries.
+    # Should match the tokenizer that produced the parquet chunks. Pass via
+    # CLI: --eos_id <int>.
+    eos_id: Optional[int] = None
+
 
 # ---------------------------------------------------------------------------
 # Checkpoint IO (atomic)
@@ -158,6 +163,7 @@ def pretrain_step(
     optimizer,
     scheduler,
     cfg: FaultlessPretrainConfig,
+    step: int,
 ) -> float:
     """One training step. Returns scalar loss."""
     input_ids = torch.from_numpy(batch["input_ids"]).long().to(cfg.device)
@@ -177,8 +183,10 @@ def pretrain_step(
     grad_norm = clip_grad(model, cfg.grad_clip)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
+    # C5 fix: WarmupCosineLR.step() requires an explicit global_step.
+    # The step counter is tracked by the caller and passed in.
     if scheduler is not None:
-        scheduler.step()
+        scheduler.step(step)
 
     return float(loss.detach()), grad_norm
 
@@ -249,6 +257,7 @@ def pretrain(model, cfg: FaultlessPretrainConfig,
         sources_filter=None,
         val_frac=0.01,
         train=True,
+        eos_id=cfg.eos_id,  # M1: pass through to mark doc boundaries
     )
     dataset.load(max_shards=cfg.max_shards)
     stats = dataset.source_stats()
@@ -288,6 +297,7 @@ def pretrain(model, cfg: FaultlessPretrainConfig,
         seq_len=cfg.seq_len,
         batch_size=cfg.batch_size,
         val_frac=0.01,
+        eos_id=cfg.eos_id,  # M1: same EOS as train
     )
     # Reuse loaded shards from main dataset
     val_dataset.shards = dataset.shards
@@ -319,7 +329,7 @@ def pretrain(model, cfg: FaultlessPretrainConfig,
         for batch in iter_factory:
             try:
                 loss, grad_norm = pretrain_step(
-                    model, batch, optimizer, scheduler, cfg
+                    model, batch, optimizer, scheduler, cfg, step
                 )
             except torch.cuda.OutOfMemoryError:
                 print(f"[pretrain] CUDA OOM at step {step}; reducing")
@@ -399,6 +409,8 @@ if __name__ == "__main__":
     parser.add_argument("--log-file", default="logs/pretrain.jsonl")
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--max-shards", type=int, default=None)
+    parser.add_argument("--eos-id", type=int, default=None,
+                        help="EOS token id used to mark doc boundaries in parquet data (M1 fix)")
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -415,6 +427,7 @@ if __name__ == "__main__":
         log_file=args.log_file,
         resume_from=args.resume_from,
         max_shards=args.max_shards,
+        eos_id=args.eos_id,  # M1: CLI override for EOS token id
         device=args.device,
         save_every=max(100, args.steps // 5),
         log_every=max(10, args.steps // 20),

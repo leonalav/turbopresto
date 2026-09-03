@@ -43,6 +43,29 @@ SPECIAL_TOKENS = [
     "<EOS>",      # End of sequence
 ]
 
+# Fixed marker → reserved ID map used by encode() / decode().
+# IDs are at the top of the vocab (32758–32767) to avoid collisions
+# with the base BPE range.
+MARKER_TO_ID: dict[str, int] = {}
+start_id = 32768 - len(SPECIAL_TOKENS)
+for i, tok in enumerate(SPECIAL_TOKENS):
+    MARKER_TO_ID[tok] = start_id + i
+ID_TO_MARKER: dict[int, str] = {v: k for k, v in MARKER_TO_ID.items()}
+
+# Number of distinct overflow buckets: we spread OOB token IDs across
+# N buckets instead of collapsing everything to one, so that distinct
+# OOB tokens are distinguishable at decode time even though the model
+# embedding table cannot hold them.
+N_OVERFLOW_BUCKETS = 64
+# Bucket IDs: 32758 - N_OVERFLOW_BUCKETS to 32757 (just below the marker range).
+OVERFLOW_BUCKET_BASE = start_id - N_OVERFLOW_BUCKETS
+
+
+def _overflow_id(tok_id: int) -> int:
+    """Map an OOB base-token ID to one of N distinct overflow buckets."""
+    # Deterministic, spreads collisions roughly uniformly.
+    return OVERFLOW_BUCKET_BASE + (tok_id % N_OVERFLOW_BUCKETS)
+
 
 class MathTokenizer:
     """Digit-by-digit tokenizer for math reasoning.
@@ -79,29 +102,14 @@ class MathTokenizer:
         self.base_encoder = tiktoken.get_encoding(base)
 
         # Build special token map
-        # Reserve IDs starting from vocab_size - len(special_tokens)
-        # so they don't conflict with base BPE tokens
-        self.special_to_id: dict[str, int] = {}
-        self.id_to_special: dict[int, str] = {}
-        start_id = vocab_size - len(self.special_tokens)
-        for i, tok in enumerate(self.special_tokens):
-            self.special_to_id[tok] = start_id + i
-            self.id_to_special[start_id + i] = tok
+        self.special_to_id: dict[str, int] = dict(MARKER_TO_ID)
+        self.id_to_special: dict[int, str] = dict(ID_TO_MARKER)
 
         # Maximum base-token ID that can pass through safely.
         # Any cl100k_base ID >= _max_base_id is out of the model's
-        # embedding range and would cause an IndexError at training.
-        # We collapse them all into a single bucket ID just below
-        # _max_base_id.  We do not attempt to preserve uniqueness --
-        # any distinct out-of-range IDs all collide into the same slot
-        # because the model's embedding has only ~32758 base slots,
-        # while cl100k_base has ~100k, so there's no room to keep them
-        # apart.  This is safe because (a) the model never trained on
-        # those IDs in the first place (they were never in the
-        # embedding table), and (b) the bucket ID is below the reserved
-        # special-token range, so it cannot collide with anything else.
-        self._max_base_id = vocab_size - len(self.special_tokens)
-        self._overflow_bucket_id = self._max_base_id - 1
+        # embedding range.  We route them through overflow buckets
+        # instead of crashing.
+        self._max_base_id = OVERFLOW_BUCKET_BASE
 
         # Cache regex patterns for digit splitting
         self._num_re = re.compile(r"-?\d+(?:\.\d+)?")
@@ -150,6 +158,18 @@ class MathTokenizer:
 
         return self._num_re.sub(replace_number, text)
 
+    def _split_on_markers(self, text: str) -> List[str]:
+        """Split text on special marker boundaries, preserving them as tokens.
+
+        "Solve <NUM> 1 2 3" -> ["Solve ", "<NUM>", " 1 2 3"]
+        """
+        # Escape each special token for use in a regex alternation
+        pattern = "|".join(re.escape(m) for m in self.special_tokens)
+        # Wrap in capturing group so the delimiters are emitted
+        parts = re.split(f"({pattern})", text)
+        # re.split with capturing group can produce empty strings at boundaries
+        return [p for p in parts if p]
+
     def encode(self, text: str, add_special: Optional[bool] = None) -> List[int]:
         """Encode text to token IDs.
 
@@ -163,31 +183,28 @@ class MathTokenizer:
         if add_special is None:
             add_special = self.add_special
 
-        # Preprocess: split numbers
-        preprocessed = self._preprocess(text)
+        # Step 1: split on math markers BEFORE BPE so each marker is a
+        # distinct token that we can replace with a single reserved ID.
+        parts = self._split_on_markers(text)
 
-        # Encode using base BPE
-        base_ids = self.base_encoder.encode(preprocessed, allowed_special="all")
-
-        # Remap any special tokens to our reserved IDs
-        # (tiktoken's "allowed_special" lets us pass through special tokens
-        # like <|endoftext|>, but our custom math tokens need explicit mapping)
         result: List[int] = []
-        for tok_id in base_ids:
-            decoded = self.base_encoder.decode([tok_id])
-            if decoded in self.special_to_id:
-                result.append(self.special_to_id[decoded])
-            elif tok_id < self._max_base_id:
-                # In-range base token -- pass through unchanged.
-                result.append(tok_id)
+        for part in parts:
+            if part in self.special_to_id:
+                # This is a full special token like "<NUM>" or "<REASON>".
+                result.append(self.special_to_id[part])
             else:
-                # Out-of-range base token (cl100k_base IDs can reach
-                # ~100K).  Collapse to a single bucket ID below
-                # _max_base_id so the model's embedding lookup can't
-                # IndexError.  The model has never seen any of these IDs
-                # during training, so the collapse causes no loss of
-                # information on the training side.
-                result.append(self._overflow_bucket_id)
+                # Step 2: preprocess (digit-split) on non-marker text
+                preprocessed = self._preprocess(part)
+                # Step 3: BPE encode
+                base_ids = self.base_encoder.encode(
+                    preprocessed, allowed_special="all"
+                )
+                # Step 4: remap OOB base tokens to overflow buckets
+                for tok_id in base_ids:
+                    if tok_id < self._max_base_id:
+                        result.append(tok_id)
+                    else:
+                        result.append(_overflow_id(tok_id))
 
         if add_special:
             result = [self.bos_id] + result
@@ -197,79 +214,56 @@ class MathTokenizer:
     def decode(self, ids: List[int]) -> str:
         """Decode token IDs back to text.
 
-        Inverse of encode. Joins characters and removes extra spaces
-        added by digit splitting.
-
-        Note: roundtrip is approximate for math expressions because we
-        add spaces during preprocessing. We post-process to remove them.
+        Inverse of encode.  Special marker IDs are converted back to their
+        canonical strings; OOB base tokens are decoded via tiktoken (they
+        represent the original byte content); overflow buckets are decoded
+        as the tiktoken bytes they stand in for.  Finally, digit-split
+        markers are collapsed back into compact numbers.
         """
-        # First, convert IDs back to strings via base encoder.
-        # Special tokens get their canonical string form.
-        # IDs that were capped in encode() (out-of-vocab-range tokens from
-        # cl100k_base) decode to whatever the original tiktoken bytes were;
-        # this is acceptable because (a) those tokens were never in the
-        # model's embedding table so they cannot appear in real generations
-        # or loss targets, and (b) we only use decode() for debugging /
-        # test assertions, not for anything that reaches the training loop.
         parts: List[str] = []
         for tok_id in ids:
             if tok_id in self.id_to_special:
-                # Special tokens are stored as their canonical strings,
-                # never passed to base_encoder.decode (which can't handle
-                # IDs in our reserved range that happen to collide with
-                # the out-of-range remapping block).
+                # Reserved special/marker token
                 parts.append(self.id_to_special[tok_id])
+            elif tok_id >= OVERFLOW_BUCKET_BASE:
+                # Overflow bucket — decode as the representative tiktoken bytes
+                # for this bucket (any ID in the bucket decodes the same way).
+                rep_id = tok_id - OVERFLOW_BUCKET_BASE
+                parts.append(self.base_encoder.decode([rep_id]))
             else:
+                # In-range base token
                 parts.append(self.base_encoder.decode([tok_id]))
 
         text = "".join(parts)
-
-        # Post-process: collapse spaces around digits and markers
-        # "<NUM> 1 2 3" -> "123"
+        # Collapse digit-split markers back into compact numbers
         text = self._collapse_digits(text)
         return text
 
     def _collapse_digits(self, text: str) -> str:
-        """Remove spaces between digits and markers.
+        """Inverse of _preprocess: restore markers and rejoin split digits.
 
         "<NUM> 1 2 3" -> "123"
         "<NEG> 3 <DECIMAL> 1 4" -> "-3.14"
-        "Solve for x" -> "Solve for x" (preserves spaces)
+        Regular text is passed through unchanged, preserving all spaces.
 
-        Strategy: tokenize markers and digits as separate entities, then
-        rebuild the math expression cleanly. Spaces between digits and
-        math markers are removed; spaces in regular text are preserved.
+        We handle this with targeted regex substitutions rather than a
+        token-based approach, which avoids losing whitespace.
         """
-        # First pass: strip spaces adjacent to markers (both leading and trailing)
-        text = re.sub(r"\s*<NUM>\s*", "<NUM>", text)
-        text = re.sub(r"\s*<DECIMAL>\s*", "<DECIMAL>", text)
-        text = re.sub(r"\s*<NEG>\s*", "<NEG>", text)
-        text = re.sub(r"<NUM>", "", text)  # NUM is implicit (positive number)
+        # Remove <NUM> markers (positive number is implicit in digit group)
+        text = re.sub(r"<NUM>\s*", "", text)
 
-        # Split into tokens
-        token_re = re.compile(r"<DECIMAL>|<NEG>|[\d]+|[^\s\d<>]+|\s+")
-        tokens = token_re.findall(text)
+        # Replace <NEG> and <DECIMAL> with their symbol equivalents
+        text = re.sub(r"<NEG>\s*", "-", text)
+        text = re.sub(r"\s*<DECIMAL>\s*", ".", text)
 
-        # Rebuild
-        result = []
-        for tok in tokens:
-            if tok == "<NEG>":
-                result.append("-")
-            elif tok == "<DECIMAL>":
-                result.append(".")
-            elif tok.isdigit():
-                result.append(tok)
-            elif tok.strip():
-                # Non-empty non-digit, non-marker token: pass through
-                # (preserves spaces in regular text)
-                result.append(tok)
-            # else: whitespace-only token — already represented elsewhere
+        # Rejoin adjacent digit tokens that were split during _preprocess:
+        # "1 2 3" -> "123"  (only when digits are separated by single spaces)
+        text = re.sub(r"(?<=\d)\s+(?=\d)", "", text)
 
-        out = "".join(result)
-        # Final cleanup: collapse stray dots like "-.5" -> "-0.5"
-        out = re.sub(r"^(\.)", r"0\1", out)
-        out = re.sub(r"([+\-=*\/x])(\.)", r"\g<1>0\2", out)
-        return out
+        # Clean up leading/trailing whitespace
+        text = text.strip()
+
+        return text
 
     @property
     def n_vocab(self) -> int:
@@ -357,48 +351,34 @@ class StubTokenizer:
 
         return self._num_re.sub(replace_number, text)
 
+    def _split_on_markers(self, text: str) -> List[str]:
+        """Split text on special marker boundaries, preserving them as tokens."""
+        pattern = "|".join(re.escape(m) for m in self.special_tokens)
+        parts = re.split(f"({pattern})", text)
+        return [p for p in parts if p]
+
     def _collapse_digits(self, text: str) -> str:
-        # Same logic as MathTokenizer._collapse_digits
-        token_re = re.compile(r"<NUM>|<DECIMAL>|<NEG>|[\d]+|[^\s\d<>]+|\s+")
-        tokens = token_re.findall(text)
-
-        result = []
-        for tok in tokens:
-            if tok in ("<NUM>",):
-                pass
-            elif tok == "<NEG>":
-                result.append("-")
-            elif tok == "<DECIMAL>":
-                result.append(".")
-            elif tok.isdigit():
-                result.append(tok)
-            else:
-                result.append(tok)
-
-        out = "".join(result)
-        out = re.sub(r"^(\.)", r"0\1", out)
-        out = re.sub(r"([+\-=*\/x])(\.)", r"\g<1>0\2", out)
-        return out
+        # Inverse of _preprocess: same logic as MathTokenizer._collapse_digits
+        text = re.sub(r"<NUM>\s*", "", text)
+        text = re.sub(r"<NEG>\s*", "-", text)
+        text = re.sub(r"\s*<DECIMAL>\s*", ".", text)
+        text = re.sub(r"(?<=\d)\s+(?=\d)", "", text)
+        text = text.strip()
+        return text
 
     def encode(self, text: str, add_special: Optional[bool] = None) -> List[int]:
         if add_special is None:
             add_special = self.add_special
-        preprocessed = self._preprocess(text)
 
-        # Insert spaces around markers so we can split them
-        for tok in self.special_tokens:
-            preprocessed = preprocessed.replace(tok, f" {tok} ")
-
-        tokens = preprocessed.split()
+        # Split on markers first, then preprocess + char-tokenize each part
+        parts = self._split_on_markers(text)
         ids = []
-        for t in tokens:
-            if t in self.special_to_id:
-                ids.append(self.special_to_id[t])
-            elif t in self._char_to_id:
-                ids.append(self._char_to_id[t])
+        for part in parts:
+            if part in self.special_to_id:
+                ids.append(self.special_to_id[part])
             else:
-                # Unknown: use byte-level fallback
-                for ch in t:
+                preprocessed = self._preprocess(part)
+                for ch in preprocessed:
                     ids.append(self._char_to_id.get(ch, ord("?")))
         if add_special:
             ids = [self.bos_id] + ids

@@ -120,17 +120,33 @@ def build_optimizer(
 
 
 class WarmupCosineLR:
-    """LambdaLR wrapper for the cosine schedule with warmup."""
+    """Custom LR scheduler: linear warmup then cosine decay.
+
+    Does NOT inherit from torch.optim.lr_scheduler.LRScheduler so that
+    callers control exactly when step() is called (with explicit
+    global_step rather than internal counters).
+    """
 
     def __init__(self, optimizer: torch.optim.Optimizer, cfg: AdamWConfig):
         self.optimizer = optimizer
         self.cfg = cfg
         self.base_lrs = [g["lr"] for g in optimizer.param_groups]
+        self._step_count = 0
 
-    def step(self, global_step: int) -> None:
-        """Update learning rate at given step."""
+    def step(self, global_step: Optional[int] = None) -> None:
+        """Update learning rate.
+
+        Args:
+            global_step: Current training step.  If omitted the internal
+                         counter is incremented by 1 (for callers that
+                         prefer auto-increment).
+        """
+        if global_step is not None:
+            self._step_count = global_step
+        else:
+            self._step_count += 1
         mult = cosine_schedule(
-            global_step,
+            self._step_count,
             self.cfg.warmup_steps,
             self.cfg.max_steps,
             self.cfg.min_lr_ratio,
@@ -140,6 +156,19 @@ class WarmupCosineLR:
 
     def get_lr(self) -> List[float]:
         return [g["lr"] for g in self.optimizer.param_groups]
+
+    # ------------------------------------------------------------------
+    # Checkpoint support (required by save_checkpoint_atomic / load_checkpoint)
+    # ------------------------------------------------------------------
+    def state_dict(self) -> dict:
+        """Return serializable state for checkpointing."""
+        return {"step_count": self._step_count}
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore scheduler from checkpoint state."""
+        self._step_count = int(state["step_count"])
+        # Re-apply the LR for the restored step so param_groups are current
+        self.step(self._step_count)
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,11 @@ from fractions import Fraction
 from typing import Optional, Union
 
 
+# Module-level compiled regex (M1 fix).
+# Matches plain integer or decimal strings only — no operators, no variables.
+_PLAIN_NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
 def extract_boxed(text: str) -> Optional[str]:
     """Extract the LAST \\boxed{...} content from text.
 
@@ -162,24 +167,53 @@ def is_equiv(pred: Optional[str], gold: Optional[str], tol: float = 1e-6) -> boo
         if isinstance(p_val, Fraction) and isinstance(g_val, (int, float)):
             return abs(float(p_val) - float(g_val)) <= tol
 
-    # 3. Last-token match (sometimes "answer = 42" vs "42")
+    # 3. Tight last-token numeric match (M1 fix: reject symbolic expressions).
+    # Matches only when both sides are short and the last token is a plain number.
+    # This eliminates false positives like "x^2 + y^2 = z^2" vs "z^2".
     pred_tokens = pred_n.split()
     gold_tokens = gold_n.split()
-    if pred_tokens and gold_tokens:
+    if (pred_tokens and gold_tokens
+            and _PLAIN_NUMBER_RE.match(pred_tokens[-1])
+            and _PLAIN_NUMBER_RE.match(gold_tokens[-1])
+            and len(pred_tokens) == len(gold_tokens)
+            and len(pred_tokens) <= 4):
         if pred_tokens[-1] == gold_tokens[-1]:
             return True
 
-    # 4. Numeric substring match
+    # 3b. Explicit "answer = N" vs "N" fallback.
+    # Catches the GSM8K convention where the predicted side has extra framing.
+    if (pred_tokens and gold_tokens
+            and len(pred_tokens) == len(gold_tokens) + 2
+            and pred_tokens[-2] == "="
+            and pred_tokens[-3].lower() in {"answer", "ans", "result"}
+            and gold_tokens[-1] == pred_tokens[-1]
+            and _PLAIN_NUMBER_RE.match(pred_tokens[-1])):
+        return True
+
+    # 4. Numeric substring match — only when numbers are in the same non-numeric context.
+    # (M1 fix: step 4 was too loose and matched "2" inside "x^2" with "2" inside "z^2".)
     p_nums = re.findall(r"-?\d+(?:\.\d+)?", pred_n)
     g_nums = re.findall(r"-?\d+(?:\.\d+)?", gold_n)
     if p_nums and g_nums and p_nums[-1] == g_nums[-1]:
-        # Same last number
-        try:
-            pf = float(p_nums[-1])
-            gf = float(g_nums[-1])
-            return abs(pf - gf) <= tol
-        except ValueError:
-            pass
+        # Same last number; now verify the non-numeric context matches.
+        # Strip all digits from each string — if the remaining symbolic parts are
+        # identical (or one is a non-empty prefix of the other), the numbers are
+        # in the same expression context.
+        p_sym = re.sub(r"\d+(?:\.\d+)?", "", pred_n).strip()
+        g_sym = re.sub(r"\d+(?:\.\d+)?", "", gold_n).strip()
+        # Non-empty but different symbolic parts mean numbers are embedded in
+        # different expressions (e.g. "x^2" vs "z^2" in "x^2 + y^2 = z^2" vs "z^2").
+        if p_sym and g_sym and p_sym != g_sym:
+            pass  # numbers in different contexts — not a match
+        else:
+            # Same context (both empty) or one is a superset of the other:
+            # "x = 5" vs "5" and "the answer is 42" vs "42" are legitimate.
+            try:
+                pf = float(p_nums[-1])
+                gf = float(g_nums[-1])
+                return abs(pf - gf) <= tol
+            except ValueError:
+                pass
 
     return False
 

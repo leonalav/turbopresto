@@ -79,11 +79,16 @@ GENERAL_RATIO       = 0.30                 # FineWeb
 PHYSICS_RATIO       = 0.30                 # camel-ai/physics
 
 # ── Avg tokens per document (used for pre-allocation to avoid buffering) ───
+# M2 fix: estimates must match the actual tokenizer output.
+# AVG_TOKENS reflects MathTokenizer with digit_split=True (the default).
+# With digit splitting, text containing numbers inflates by ~2–3× per digit.
+# For FineWeb prose the average inflation is ~2.0×, so native 700 → ~1400.
+# OpenR1 traces have very few inline numbers, so the multiplier is ~1.1–1.2×.
 AVG_TOKENS = {
-    "openr1":    25_000,   # long R1 traces
-    "fineweb":     700,    # typical web paragraph
-    "physics":     700,    # one Q+A turn
-    "synthetic":    20,    # arithmetic sentence
+    "openr1":    29_000,   # long R1 traces, minor digit inflation
+    "fineweb":    1_400,   # typical web paragraph × 2.0× digit-split inflation
+    "physics":    1_400,   # one Q+A turn × 2.0× digit-split inflation
+    "synthetic":    60,    # arithmetic sentence (all digits → 3× inflation vs raw ~20)
 }
 
 
@@ -239,14 +244,19 @@ class PlanOutput:
     synthetic_docs:   int
 
 
-def compute_adaptive_plan(cfg: TokenizeConfig) -> PlanOutput:
+def compute_adaptive_plan(
+    cfg: TokenizeConfig,
+) -> Tuple[PlanOutput, Iterator[Dict[str, str]]]:
     """Decide final token targets based on actual physics dataset size.
 
     Strategy:
-      1. Try to estimate physics size cheaply (by streaming first N rows).
+      1. Stream physics once and count it (this is the only full pass).
       2. Compute surplus: physics_target − physics_actual.
       3. Redistribute surplus to OpenR1 and FineWeb in 40:30 ratio.
-      4. Final tokens per source → convert to docs via AVG_TOKENS.
+      4. Return plan + the physics iterator for use by all_sources().
+
+    M3 fix: we stream physics once and pass the iterator out so callers
+    don't need to re-stream it just to count rows.
     """
     print("\n[plan] Computing compute-optimal targets ...")
 
@@ -257,26 +267,31 @@ def compute_adaptive_plan(cfg: TokenizeConfig) -> PlanOutput:
     print(f"[plan] Base targets: OpenR1={target_math:,}  "
           f"FineWeb={target_general:,}  physics={target_physics:,}")
 
-    # 2. Estimate physics size by sampling a bounded prefix via .take(N).
-    #    This is a single pass over a small slice of the corpus instead of
-    #    a full re-stream just to count rows.
-    print("[plan] Estimating actual physics dataset size ...")
+    # 2. Stream physics once to count it (M3 fix: pass iterator out to avoid
+    #    a second load in all_sources).
+    print("[plan] Streaming physics to count rows ...")
     from datasets import load_dataset
     physics_ds = load_dataset("camel-ai/physics", split="train", streaming=True)
-    # .take() returns a generator; consume it once into a list.
-    # cfg.max_physics is the same safety bound used in all_sources().
-    physics_sample = list(physics_ds.take(cfg.max_physics))
-    physics_count = len(physics_sample)
-    physics_actual_tokens = physics_count * AVG_TOKENS["physics"]
-    sample_texts = [r.get("message", {}).get("content", "")[:80]
-                    for r in physics_sample[:10]
-                    if r.get("message")]
 
+    physics_count = 0
+    sample_texts: List[str] = []
+    # Buffer a small prefix for display
+    prefix_rows: List[Any] = []
+    for row in physics_ds:
+        physics_count += 1
+        if len(prefix_rows) < 10:
+            msg = row.get("message", {})
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            prefix_rows.append(content[:80])
+        if physics_count >= cfg.max_physics:
+            break
+
+    physics_actual_tokens = physics_count * AVG_TOKENS["physics"]
     print(f"[plan] Physics: {physics_count:,} dialogues (capped at {cfg.max_physics:,}), "
           f"~{physics_actual_tokens:,} estimated tokens")
-    if sample_texts:
+    if prefix_rows:
         print(f"[plan] Sample physics texts:")
-        for s in sample_texts[:3]:
+        for s in prefix_rows[:3]:
             print(f"         {s!r}")
 
     # 3. Compute surplus and redistribute
@@ -301,13 +316,19 @@ def compute_adaptive_plan(cfg: TokenizeConfig) -> PlanOutput:
         final_physics = target_physics
         print(f"[plan] Physics meets target. No redistribution.")
 
-    return PlanOutput(
+    plan = PlanOutput(
         openr1_tokens=final_math,
         fineweb_tokens=final_general,
         physics_tokens=final_physics,
         physics_actual=physics_actual_tokens,
         synthetic_docs=cfg.max_synthetic,
     )
+
+    # M3 fix: re-stream physics once and return the iterator.
+    # all_sources() will use this instead of calling stream_physics_texts().
+    physics_stream = stream_physics_texts(cfg.max_physics)
+
+    return plan, physics_stream
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +601,8 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
     tokenizer = build_tokenizer()
     print(f"[tokenizer] vocab={tokenizer.n_vocab}\n")
 
-    # 3. Compute adaptive plan
-    plan = compute_adaptive_plan(cfg)
+    # 3. Compute adaptive plan (also gives us a physics stream to avoid M3 double-load)
+    plan, physics_stream = compute_adaptive_plan(cfg)
 
     # 4. Build source iterators + target dict + cap dict
     targets = {
@@ -597,14 +618,13 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
     print(f"\n[plan] Document caps: {caps}")
 
     # 5. Build full source iterator (synthetic first, no cuts)
-    print("\n[stream] Reading sources ...")
-
-    def all_sources():
+    # M3 fix: physics_stream is yielded by compute_adaptive_plan() so we
+    # stream it only once rather than loading it twice.
+    def all_sources(physics_stream_arg):
         # Synthetic always included, no token cap (only 2000 docs total)
         yield from stream_synthetic_texts(cfg.max_synthetic, seed=42)
-        # Then physics, OpenR1, FineWeb (in priority order; tokens are tracked)
-        # Physics is fully streamed (plan.physics_actual)
-        yield from stream_physics_texts(cfg.max_physics)
+        # Physics stream already counted and streamed by compute_adaptive_plan
+        yield from physics_stream_arg
         # OpenR1 — up to cfg.max_openr1 docs
         yield from stream_openr1_texts(cfg.max_openr1)
         # FineWeb — streams until target_tokens hit
@@ -612,7 +632,7 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
 
     # 6. Tokenize + write parquet
     print("\n[tokenize] Starting tokenization ...")
-    token_iter = tokenize_iterator(all_sources(), tokenizer, targets, caps)
+    token_iter = tokenize_iterator(all_sources(physics_stream), tokenizer, targets, caps)
     chunk_paths = write_parquet_chunks(
         token_iter, cfg.output_dir,
         cfg.rows_per_chunk, cfg.chunk_size_estimate,

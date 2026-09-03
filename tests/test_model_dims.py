@@ -151,3 +151,13 @@ class TestArchitectureInvariants:
         """dim_ffn = d_model * ffn_mult."""
         cfg = ModelConfig(d_model=512, ffn_mult=4)
         assert cfg.dim_ffn == 2048
+
+    def test_dim_ffn_float_accepted(self):
+        """C3 fix: float ffn_mult is accepted (YAML sets 2.75)."""
+        cfg = ModelConfig(d_model=512, ffn_mult=2.75)
+        assert cfg.dim_ffn == int(512 * 2.75)  # 1408
+
+    def test_dim_ffn_rejects_string(self):
+        """C3 fix: non-numeric ffn_mult raises TypeError, not silent failure."""
+        with pytest.raises(TypeError):
+            ModelConfig(d_model=512, ffn_mult="2.75")  # type: ignore[arg-type]
