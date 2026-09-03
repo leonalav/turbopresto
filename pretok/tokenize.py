@@ -33,11 +33,23 @@ Uploads to:
   https://huggingface.co/datasets/leonidas123/valkmodel-data
 
 Usage:
-  # Local (requires .env with HF_TOKEN)
+  # Local — tokenize and save to ./parquet_chunks/ (HF_TOKEN optional)
   python pretok/tokenize.py
+
+  # Local — also upload to HF Hub (requires HF_TOKEN)
+  HF_TOKEN=hf_xxx python pretok/tokenize.py
 
   # Modal 32-CPU VM
   modal run pretok/tokenize.py
+
+HF_TOKEN: read from the environment variable (e.g. `export HF_TOKEN=hf_xxx`
+on bash, `$env:HF_TOKEN='hf_xxx'` on PowerShell) or, as a fallback, from a
+.env file at the repo root.  The token is ONLY needed for the upload step
+— tokenization and parquet writing work without it (the three source
+datasets — tokyotech-llm/swallow-math, HuggingFaceFW/fineweb,
+ajibawa-2023/Python-Code-Large — are public and streamed without auth).
+If HF_TOKEN is unset, the run skips upload and keeps parquet chunks in
+./parquet_chunks/.
 """
 
 from __future__ import annotations
@@ -448,8 +460,13 @@ def write_parquet_chunks(
 # HF Hub upload
 # ---------------------------------------------------------------------------
 
-def _get_hf_token(token_env: str) -> str:
-    """Read HF token from environment or .env file."""
+def _get_hf_token(token_env: str) -> Optional[str]:
+    """Read HF token from environment or .env file.
+
+    Returns the token string, or None if not configured.  This is
+    NEVER raised as an error — tokenization does not require a token;
+    only the optional HF Hub upload step does.
+    """
     token = os.environ.get(token_env)
     if token:
         return token
@@ -460,10 +477,7 @@ def _get_hf_token(token_env: str) -> str:
                 token = line.split("=", 1)[1].strip().strip('"').strip("'")
                 if token:
                     return token
-    raise RuntimeError(
-        f"{token_env} not set in environment or {env_path}. "
-        f"Cannot upload to HF Hub."
-    )
+    return None
 
 
 def upload_to_hub(
@@ -553,9 +567,14 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
           f"general={GENERAL_RATIO*100:.0f}% python_code={PYTHON_CODE_RATIO*100:.0f}%")
     print()
 
-    # 1. Validate HF token
+    # 1. Resolve HF token (optional — only required if you want to upload)
     hf_token = _get_hf_token(cfg.hf_token_env)
-    print("[hf] Token loaded.\n")
+    if hf_token:
+        print(f"[hf] Token loaded from {cfg.hf_token_env} — upload will run.\n")
+    else:
+        print("[hf] No HF_TOKEN set — upload will be SKIPPED.")
+        print("[hf] Parquet chunks will be kept locally at:", cfg.output_dir)
+        print("[hf] Set HF_TOKEN in your shell and re-run to upload.\n")
 
     # 2. Build tokenizer
     print("[tokenizer] Loading MathTokenizer ...")
@@ -597,20 +616,25 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
         cfg.rows_per_chunk, cfg.chunk_size_estimate,
     )
 
-    # 7. Upload
-    print("\n[huggingface] Uploading ...")
-    upload_to_hub(chunk_paths, HF_REPO_ID, hf_token, plan)
+    # 7. Upload (only if HF token is available)
+    if hf_token:
+        print("\n[huggingface] Uploading ...")
+        upload_to_hub(chunk_paths, HF_REPO_ID, hf_token, plan)
 
-    # 8. Cleanup local parquet
-    for p in chunk_paths:
-        p.unlink()
-    manifest_local = LOCAL_DATA_DIR / "manifest.json"
-    if manifest_local.exists():
-        manifest_local.unlink()
-    try:
-        LOCAL_DATA_DIR.rmdir()
-    except OSError:
-        pass
+        # 8. Cleanup local parquet (only after successful upload)
+        for p in chunk_paths:
+            p.unlink()
+        manifest_local = LOCAL_DATA_DIR / "manifest.json"
+        if manifest_local.exists():
+            manifest_local.unlink()
+        try:
+            LOCAL_DATA_DIR.rmdir()
+        except OSError:
+            pass
+    else:
+        print("\n[huggingface] Skipped upload (no HF_TOKEN).")
+        print(f"[huggingface] Parquet chunks kept locally in: {cfg.output_dir}")
+        print(f"[huggingface] {len(chunk_paths)} chunk(s) ready for upload later.")
 
     elapsed = time.time() - t_start
     print(f"\n=== Done in {elapsed:.1f}s ===")
