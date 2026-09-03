@@ -1,0 +1,42 @@
+[project]
+name = "rwkv7-math-llm"
+version = "0.1.0"
+description = "50M parameter RWKV-7 math reasoning model"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "einops>=0.7.0",
+    "numpy>=1.24",
+    "tiktoken>=0.5.0",
+    "datasets>=2.14.0",
+    "huggingface-hub>=0.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pyyaml>=6.0",
+]
+deploy = [
+    "modal>=0.50.0",
+]
+tracking = [
+    "wandb>=0.15.0",
+    "trackio>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "slow: marks tests as slow",
+    "integration: marks tests as integration tests",
+]

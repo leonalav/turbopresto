@@ -1,0 +1,83 @@
+# Default configuration for RWKV-7 50M math LLM
+# Override any field via CLI: --config config.yaml --override model.d_model=768
+
+model:
+  vocab_size: 32768        # Custom math-aware tokenizer
+  n_layers: 8              # RWKV-7 blocks
+  d_model: 512             # Hidden dimension
+  d_state: 64              # State dimension (per channel)
+  ctx_len: 4096            # Training context length
+  ffn_mult: 2.75           # FFN intermediate multiplier
+  tie_embeddings: true     # Save params (input == output)
+  dtype: "bfloat16"        # Use bfloat16 for state; float32 for stability
+
+tokenizer:
+  type: "math_digit_bpe"
+  base: "cl100k_base"      # tiktoken base
+  digit_split: true        # Force digit-by-digit splitting
+  special_tokens:
+    - "<NUM>"
+    - "<DECIMAL>"
+    - "<NEG>"
+    - "<REASON>"
+    - "</REASON>"
+    - "<ANSWER>"
+    - "</ANSWER>"
+    - "<PAD>"
+
+training:
+  pretrain:
+    batch_size: 16
+    grad_accum: 4
+    lr: 6.0e-4
+    weight_decay: 0.1
+    warmup_steps: 1000
+    max_steps: 50000
+    seq_len: 4096
+    save_every: 5000
+    log_every: 50
+    grad_clip: 1.0
+    cosine_min_lr_ratio: 0.1
+
+  sft:
+    batch_size: 8
+    grad_accum: 8
+    lr: 1.0e-5
+    weight_decay: 0.01
+    warmup_steps: 100
+    max_steps: 5000
+    seq_len: 2048
+    save_every: 1000
+    log_every: 20
+    grad_clip: 1.0
+
+  grpo:
+    group_size: 8           # G rollouts per prompt
+    batch_size: 4           # Prompts per batch
+    lr: 5.0e-6
+    max_steps: 3000
+    seq_len: 1024
+    kl_coef: 0.04           # Beta for KL penalty
+    clip_eps: 0.2           # PPO clip epsilon
+    entropy_coef: 0.01      # Entropy bonus
+    use_mc_grpo: true       # Use median baseline
+    grad_clip: 1.0
+    save_every: 500
+    log_every: 10
+
+inference:
+  max_new_tokens: 512
+  temperature: 0.7
+  top_p: 0.95
+  top_k: 50
+  voting_n: 16              # Number of samples for majority voting
+
+eval:
+  gsm8k_split: "test"
+  math_split: "test"
+  arithmetic_max_digits: 4
+
+paths:
+  data_dir: "data"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
