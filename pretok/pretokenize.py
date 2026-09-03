@@ -598,6 +598,93 @@ def write_parquet_chunks(
 
 
 # ---------------------------------------------------------------------------
+# Local-disk prefetch (decouples HF network throughput from worker count)
+# ---------------------------------------------------------------------------
+
+def _prefetch_to_disk(
+    cfg: "PretokenizeConfig",
+    plan: "Plan",
+    cache_dir: Path,
+) -> Dict[str, Path]:
+    """Download all HF datasets to local JSONL shards BEFORE tokenization.
+
+    Why: with 24 workers, each forked worker is sharing the main process's
+    HTTP connection pool to HF's CDN.  HF throttles per-IP concurrent
+    downloads (typically 8-16), so beyond that you get slowdown AND
+    "peer closed connection" errors.  Tokenization is CPU-bound, not
+    network-bound, so we should keep workers focused on tokenizing and
+    pull the network bytes in serial.
+
+    After this returns, the tokenization phase reads from local disk
+    (essentially free I/O), so all 24 workers stay busy on the bottleneck.
+
+    Idempotent: re-running the script skips already-complete shards.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    caps = {
+        "swallow":     cfg.max_swallow,
+        "python_code": cfg.max_python_code,
+        "fineweb":     docs_for_tokens(plan.fineweb_tokens, "fineweb"),
+    }
+
+    sources: List[Tuple[str, int]] = [
+        ("synthetic",   cfg.max_synthetic),
+        ("swallow",     caps["swallow"]),
+        ("python_code", caps["python_code"]),
+        ("fineweb",     caps["fineweb"]),
+    ]
+
+    iterators = {
+        "synthetic":   lambda n: stream_synthetic_texts(n, seed=42),
+        "swallow":     lambda n: stream_swallow_texts(n),
+        "python_code": lambda n: stream_python_code_texts(n),
+        "fineweb":     lambda n: stream_fineweb_texts(plan.fineweb_tokens),
+    }
+
+    paths: Dict[str, Path] = {}
+    for source, n in sources:
+        shard_path = cache_dir / f"{source}.jsonl"
+        # Idempotency: skip if a complete shard already exists.
+        if shard_path.exists() and shard_path.stat().st_size > 0:
+            existing = sum(1 for _ in shard_path.open("rb"))
+            print(f"[prefetch] {source}: reusing {shard_path} ({existing:,} rows)")
+            paths[source] = shard_path
+            continue
+
+        print(f"[prefetch] {source}: downloading to {shard_path} ...")
+        t0 = time.time()
+        count = 0
+        bytes_written = 0
+        with shard_path.open("w", encoding="utf-8") as f:
+            for record in iterators[source](n):
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                bytes_written += len(record.get("text", "")) + 32
+                count += 1
+                if count % 5000 == 0:
+                    elapsed = time.time() - t0
+                    rate = count / elapsed if elapsed > 0 else 0
+                    print(f"[prefetch] {source}: {count:,} rows "
+                          f"({rate:.0f} rows/s, {bytes_written / 1e6:.1f} MB)")
+        elapsed = time.time() - t0
+        print(f"[prefetch] {source}: wrote {count:,} rows in "
+              f"{elapsed:.1f}s ({bytes_written / 1e6:.1f} MB)")
+        paths[source] = shard_path
+
+    return paths
+
+
+def _disk_iter(path: Path) -> Iterator[Dict[str, str]]:
+    """Replay a JSONL shard back as the original text iterator."""
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+# ---------------------------------------------------------------------------
 # HF Hub upload
 # ---------------------------------------------------------------------------
 
@@ -744,19 +831,26 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
     print(f"[plan] Workers: {cfg.workers} "
           f"(batch_size={cfg.encode_batch_size})\n")
 
-    # 5. Build full source iterator (synthetic first, no cuts)
-    def all_sources():
-        # Synthetic always included, no token cap (only 2000 docs total)
-        yield from stream_synthetic_texts(cfg.max_synthetic, seed=42)
-        # Swallow-math — up to max_swallow docs
-        yield from stream_swallow_texts(cfg.max_swallow)
-        # Python code — up to max_python_code docs, Python 3 filtered
-        yield from stream_python_code_texts(cfg.max_python_code)
-        # FineWeb — streams until target_tokens hit
-        yield from stream_fineweb_texts(plan.fineweb_tokens)
+    # 5. Prefetch HF datasets to local JSONL shards (single-threaded;
+    #    HF's CDN throttles concurrent downloads, so serial is faster
+    #    than 24-way parallel and avoids "peer closed connection" drops).
+    cache_dir = cfg.output_dir.parent / "prefetch_cache"
+    shards = _prefetch_to_disk(cfg, plan, cache_dir)
+    print()
 
-    # 6. Tokenize + write parquet
-    print("\n[tokenize] Starting tokenization ...")
+    # 6. Build source iterator (synthetic first, no cuts)
+    def all_sources():
+        # Synthetic first — fully local, always available
+        yield from _disk_iter(shards["synthetic"])
+        # Swallow-math
+        yield from _disk_iter(shards["swallow"])
+        # Python code (already Python-3 filtered)
+        yield from _disk_iter(shards["python_code"])
+        # FineWeb — already cut to target
+        yield from _disk_iter(shards["fineweb"])
+
+    # 7. Tokenize + write parquet
+    print("[tokenize] Starting tokenization (reads from local prefetch cache) ...")
     if cfg.workers > 1:
         print(f"[tokenize] Parallel mode: {cfg.workers} workers, "
               f"batch={cfg.encode_batch_size}")
