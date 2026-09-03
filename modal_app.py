@@ -438,10 +438,8 @@ def main(stage: str = "pretrain", **kwargs):
     elif stage == "eval":
         run_eval(**kwargs)
     elif stage == "pretok":
-        # Delegate to pretok/tokenize.py on a 32-CPU Modal VM
-        import sys
-        sys.path.insert(0, str(Path(__file__).parent / "pretok"))
-        from pretok.tokenize import upload_pretokenized
+        # Delegate to pretok/pretokenize.py on a 32-CPU Modal VM
+        from pretok.pretokenize import upload_pretokenized
         upload_pretokenized.remote(
             max_openr1=kwargs.get("max_openr1", 50_000),
             max_physics=kwargs.get("max_physics", 30_000),

@@ -18,7 +18,7 @@ A row is PASS if:
 Usage:
   python pretok/test_tokenizer.py
 
-NOTE: Run `modal run pretok/tokenize.py` first to upload the pretokenized data.
+NOTE: Run `python -m pretok.pretokenize` first to upload the pretokenized data.
 """
 
 from __future__ import annotations
@@ -160,7 +160,7 @@ def run_test() -> None:
         print(f"ERROR: {exc}")
         print(
             "\nNOTE: The dataset may not exist yet. "
-            "Run `modal run pretok/tokenize.py` first to upload pretokenized data."
+            "Run `python -m pretok.pretokenize` first to upload pretokenized data."
         )
         sys.exit(1)
 

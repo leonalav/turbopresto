@@ -1,7 +1,7 @@
 """Faultless pre-training loop using pretokenized parquet data.
 
 Reads tokens directly from parquet chunks uploaded to
-leonidas123/valkmodel-data (produced by `pretok/tokenize.py`).
+leonidas123/valkmodel-data (produced by `python -m pretok.pretokenize`).
 
 Features beyond `pretrain.py`:
   - Streams pretokenized tokens (no tokenization on GPU VM)

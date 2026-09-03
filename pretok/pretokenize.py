@@ -33,14 +33,18 @@ Uploads to:
   https://huggingface.co/datasets/leonidas123/valkmodel-data
 
 Usage:
-  # Local — tokenize and save to ./parquet_chunks/ (HF_TOKEN optional)
-  python pretok/tokenize.py
+  # Linux VM (24 CPUs): tokenize locally with all 24 cores, no upload
+  python -m pretok.pretokenize --workers 24 --no-upload
 
-  # Local — also upload to HF Hub (requires HF_TOKEN)
-  HF_TOKEN=hf_xxx python pretok/tokenize.py
+  # Linux VM: tokenize + upload to HF Hub
+  HF_TOKEN=hf_xxx python -m pretok.pretokenize --workers 24
+
+  # Local sanity check (small caps, sequential)
+  python -m pretok.pretokenize --workers 1 --max-swallow 100 \
+      --max-python-code 1000 --no-upload
 
   # Modal 32-CPU VM
-  modal run pretok/tokenize.py
+  modal run pretok/pretokenize.py
 
 HF_TOKEN: read from the environment variable (e.g. `export HF_TOKEN=hf_xxx`
 on bash, `$env:HF_TOKEN='hf_xxx'` on PowerShell) or, as a fallback, from a
@@ -48,8 +52,18 @@ on bash, `$env:HF_TOKEN='hf_xxx'` on PowerShell) or, as a fallback, from a
 — tokenization and parquet writing work without it (the three source
 datasets — tokyotech-llm/swallow-math, HuggingFaceFW/fineweb,
 ajibawa-2023/Python-Code-Large — are public and streamed without auth).
-If HF_TOKEN is unset, the run skips upload and keeps parquet chunks in
-./parquet_chunks/.
+If HF_TOKEN is unset (or --no-upload is passed), the run skips upload and
+keeps parquet chunks in ./parquet_chunks/.
+
+VM notes:
+  • Code is platform-neutral; runs identically on Linux, macOS, Windows.
+  • Disk: expect ~10–12 GB of parquet under ./parquet_chunks/ before upload.
+  • Workers default to os.cpu_count(). On Linux the pool uses the 'fork'
+    start method (cheap). tiktoken is fork-safe; each worker constructs
+    its own MathTokenizer.
+  • If the run is interrupted, re-running resumes cleanly: parquet_chunks/
+    is overwritten, the script doesn't track per-chunk resumption (start
+    over if interrupted mid-run).
 """
 
 from __future__ import annotations
@@ -114,6 +128,12 @@ class TokenizeConfig:
     output_dir:   Path = field(default_factory=lambda: LOCAL_DATA_DIR)
     rows_per_chunk: int = ROWS_PER_CHUNK
     chunk_size_estimate: int = CHUNK_SIZE_ESTIMATE_BYTES
+    # Tokenization parallelism.  Set to 1 to disable multiprocessing.
+    workers: int = field(default_factory=lambda: max(1, (os.cpu_count() or 1)))
+    # Records per pool task — small batches keep cap-tracking responsive.
+    encode_batch_size: int = 32
+    # If True, skip the HF Hub upload step even if HF_TOKEN is set.
+    no_upload: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +387,87 @@ def tokenize_iterator(
 
 
 # ---------------------------------------------------------------------------
+# Parallel tokenization (workers > 1)
+# ---------------------------------------------------------------------------
+
+def _encode_batch(records: List[Dict]) -> List[Dict]:
+    """Module-level worker: tokenize a small batch of records.
+
+    Lives at module scope so multiprocessing can pickle it.  Each forked
+    worker constructs its own MathTokenizer (tiktoken Encoding is
+    fork-safe but not shareable across processes).
+    """
+    from src.tokenizer.math_tokenizer import MathTokenizer  # type: ignore
+    tok = MathTokenizer()
+    out = []
+    for r in records:
+        text = r["text"]
+        ids = tok.encode(text, add_special=False)
+        out.append({
+            "source":   r["source"],
+            "text":     text,
+            "tokens":   ids,
+            "n_tokens": len(ids),
+        })
+    return out
+
+
+def parallel_tokenize_iterator(
+    text_iterator: Iterator[Dict],
+    targets: Dict[str, int],
+    source_caps: Dict[str, int],
+    workers: int,
+    batch_size: int = 32,
+) -> Iterator[Dict]:
+    """Producer/consumer tokenizer: source iter runs in main process,
+    encoding runs in a ProcessPool.
+
+    Cap tracking stays in the main process; workers tokenize small
+    batches and the main process post-filters against target and
+    document caps.  A small batch_size keeps wasted encode work
+    bounded when a cap is hit mid-batch.
+    """
+    import multiprocessing as mp
+
+    accumulated: Dict[str, int] = {src: 0 for src in targets}
+    counts: Dict[str, int] = {src: 0 for src in source_caps}
+
+    ctx = mp.get_context("fork")
+    pool = ctx.Pool(processes=workers, maxtasksperchild=64)
+
+    def _batches():
+        batch: List[Dict] = []
+        for record in text_iterator:
+            batch.append(record)
+            if len(batch) >= batch_size:
+                yield batch
+                batch = []
+        if batch:
+            yield batch
+
+    try:
+        for result_batch in pool.imap_unordered(
+            _encode_batch, _batches(), chunksize=1
+        ):
+            for record in result_batch:
+                source = record["source"]
+                # Sources not in target plan (e.g. synthetic) bypass caps.
+                if source not in targets:
+                    yield record
+                    continue
+                if accumulated[source] >= targets[source]:
+                    continue
+                if counts[source] >= source_caps[source]:
+                    continue
+                accumulated[source] += record["n_tokens"]
+                counts[source] += 1
+                yield record
+    finally:
+        pool.close()
+        pool.join()
+
+
+# ---------------------------------------------------------------------------
 # Parquet chunking
 # ---------------------------------------------------------------------------
 
@@ -568,15 +669,19 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
     print()
 
     # 1. Resolve HF token (optional — only required if you want to upload)
-    hf_token = _get_hf_token(cfg.hf_token_env)
-    if hf_token:
+    hf_token = None if cfg.no_upload else _get_hf_token(cfg.hf_token_env)
+    if cfg.no_upload:
+        print("[hf] --no-upload set — upload step will be SKIPPED.")
+        print("[hf] Parquet chunks will be kept locally at:", cfg.output_dir, "\n")
+    elif hf_token:
         print(f"[hf] Token loaded from {cfg.hf_token_env} — upload will run.\n")
     else:
         print("[hf] No HF_TOKEN set — upload will be SKIPPED.")
         print("[hf] Parquet chunks will be kept locally at:", cfg.output_dir)
         print("[hf] Set HF_TOKEN in your shell and re-run to upload.\n")
 
-    # 2. Build tokenizer
+    # 2. Build tokenizer (used by sequential path; parallel workers build
+    #    their own copies inside the forked pool)
     print("[tokenizer] Loading MathTokenizer ...")
     tokenizer = build_tokenizer()
     print(f"[tokenizer] vocab={tokenizer.n_vocab}\n")
@@ -596,6 +701,8 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
         "fineweb":     docs_for_tokens(plan.fineweb_tokens, "fineweb"),
     }
     print(f"\n[plan] Document caps: {caps}")
+    print(f"[plan] Workers: {cfg.workers} "
+          f"(batch_size={cfg.encode_batch_size})\n")
 
     # 5. Build full source iterator (synthetic first, no cuts)
     def all_sources():
@@ -610,14 +717,28 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
 
     # 6. Tokenize + write parquet
     print("\n[tokenize] Starting tokenization ...")
-    token_iter = tokenize_iterator(all_sources(), tokenizer, targets, caps)
+    if cfg.workers > 1:
+        print(f"[tokenize] Parallel mode: {cfg.workers} workers, "
+              f"batch={cfg.encode_batch_size}")
+        token_iter = parallel_tokenize_iterator(
+            all_sources(), targets, caps,
+            workers=cfg.workers,
+            batch_size=cfg.encode_batch_size,
+        )
+    else:
+        print("[tokenize] Sequential mode (workers=1)")
+        token_iter = tokenize_iterator(all_sources(), tokenizer, targets, caps)
     chunk_paths = write_parquet_chunks(
         token_iter, cfg.output_dir,
         cfg.rows_per_chunk, cfg.chunk_size_estimate,
     )
 
-    # 7. Upload (only if HF token is available)
-    if hf_token:
+    # 7. Upload (only if HF token is available and not disabled)
+    if cfg.no_upload:
+        print("\n[huggingface] Skipped upload (--no-upload).")
+        print(f"[huggingface] Parquet chunks kept locally in: {cfg.output_dir}")
+        print(f"[huggingface] {len(chunk_paths)} chunk(s) ready for upload later.")
+    elif hf_token:
         print("\n[huggingface] Uploading ...")
         upload_to_hub(chunk_paths, HF_REPO_ID, hf_token, plan)
 
@@ -690,17 +811,45 @@ if is_modal:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max-swallow", type=int, default=50_000)
+    parser = argparse.ArgumentParser(
+        description="Pretokenize the 2B-token pretraining corpus. "
+                    "By default uploads to HF Hub if HF_TOKEN is set.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--max-swallow",     type=int, default=50_000)
     parser.add_argument("--max-python-code", type=int, default=500_000)
-    parser.add_argument("--max-synthetic", type=int, default=2_000)
-    parser.add_argument("--local", action="store_true")
+    parser.add_argument("--max-synthetic",   type=int, default=2_000)
+    parser.add_argument(
+        "--workers", type=int,
+        default=os.cpu_count() or 1,
+        help="Number of encoding workers (processes). Default: os.cpu_count().",
+    )
+    parser.add_argument(
+        "--encode-batch-size", type=int, default=32,
+        help="Records per pool task — smaller = lower wasted work when a "
+             "cap is hit mid-batch.",
+    )
+    parser.add_argument(
+        "--no-upload", action="store_true",
+        help="Skip the HF Hub upload even if HF_TOKEN is set. Chunks are "
+             "kept locally in ./parquet_chunks/.",
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=LOCAL_DATA_DIR,
+        help="Where to write parquet chunks before upload.",
+    )
+    parser.add_argument("--local", action="store_true",
+                        help="Force the local path even if modal is installed.")
     args = parser.parse_args()
 
     cfg = TokenizeConfig(
         max_swallow=args.max_swallow,
         max_python_code=args.max_python_code,
         max_synthetic=args.max_synthetic,
+        workers=args.workers,
+        encode_batch_size=args.encode_batch_size,
+        no_upload=args.no_upload,
+        output_dir=args.output_dir,
     )
 
     if args.local or not is_modal:

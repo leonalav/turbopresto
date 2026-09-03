@@ -2,7 +2,7 @@
 
 Loads pretokenized parquet files from HuggingFace Hub and yields token-id
 arrays for training. Designed to work with the pretokenized output from
-`pretok/tokenize.py`.
+`python -m pretok.pretokenize`.
 
 Features:
   - Streams chunks via hf_hub_download (no full repo clone)
