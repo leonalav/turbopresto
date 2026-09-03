@@ -8,6 +8,23 @@ Key differences from pretraining:
 - Lower LR (1e-5 vs 6e-4)
 - Mask prompt tokens from loss (only train on target)
 - Format-specific data
+
+────────────────────────────────────────────────────────────────────────────
+SFT data sources:
+  - tatsu-lab/alpaca              — General instruction-following (52k rows)
+  - open-r1/OpenR1-Math-220k      — R1 reasoning traces (94k math problems)
+  - camel-ai/physics              — Physics dialogues (camel-ai/physics)
+  - SyntheticMathDataset          — Simple arithmetic (2000 examples)
+
+Format separation rationale:
+  - Math/physics use `<REASON>...</REASON><ANSWER>...</ANSWER>` delimiters.
+  - Alpaca uses bare `Instruction: ... Response:` to keep it from mixing
+    with math delimiters — this prevents the model from accidentally emitting
+    `<ANSWER>` after non-math prompts.
+
+NOTE: GSM8K and MATH (hendrycks/competition_math) are BENCHMARK datasets.
+They must NEVER appear in training data — only in evaluation.
+────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -23,8 +40,6 @@ import torch
 import torch.nn.functional as F
 
 from src.data.collator import collate_for_sft
-from src.data.gsm8k import GSM8KDataset
-from src.data.math_dataset import MATHDataset
 from src.data.synthetic import SyntheticMathDataset
 from src.model.config import ModelConfig
 from src.model.rwkv7 import RWKV7Model
@@ -62,33 +77,126 @@ class SFTConfig:
 
 
 def build_sft_examples(cfg: SFTConfig) -> List[Dict[str, str]]:
-    """Build SFT (prompt, target) pairs from multiple sources."""
+    """Build SFT (prompt, target) pairs from multiple sources.
+
+    IMPORTANT: GSM8K and MATH are evaluation benchmarks only.  Do NOT add them
+    to this function under any circumstances.
+    """
     examples: List[Dict[str, str]] = []
 
-    # Synthetic
+    # ── Synthetic ────────────────────────────────────────────────────────────
     syn = SyntheticMathDataset(size=2000, max_digits=3, seed=cfg.seed)
     for i in range(len(syn)):
         examples.append({"source": "synthetic", **dict(zip(["prompt", "target"], syn.format_for_sft(i)))})
 
-    # GSM8K
+    # ── tatsu-lab/alpaca ────────────────────────────────────────────────────
+    # General instruction-following data (Self-Instruct, 52k rows).
+    # Schema: {instruction: str, input: str (often empty), output: str, text: str}.
+    # ~41k rows have empty `input`; ~11k have non-empty `input`.
+    # Total ≈ 52,002 rows on the train split.
+    #
+    # We use bare "Instruction: ... Response:" framing (NOT the math
+    # <REASON>/<ANSWER> delimiters) so the model learns a clean separation
+    # between non-math instructions and math reasoning — no risk of the
+    # model emitting <ANSWER> tags after "Hello!".
+    #
+    # Dataset size rationale: 50M base model, standard Alpaca recipe.  52k
+    # is the original Stanford Alpaca count that taught LLaMA-7B to be a
+    # helpful assistant.  Going lower (LIMA 1k) is too sparse for a small
+    # base to generalize, going higher dilutes math signal.
     try:
-        gsm = GSM8KDataset(split="train")
-        if len(gsm) > 0:
-            for i in range(min(len(gsm), 5000)):
-                p, t = gsm.format_for_sft(i)
-                examples.append({"source": "gsm8k", "prompt": p, "target": t})
-    except Exception:
-        pass
+        from datasets import load_dataset
+        alpaca_ds = load_dataset(
+            "tatsu-lab/alpaca",
+            split="train",
+            trust_remote_code=True,
+        )
+        count = 0
+        skipped = 0
+        for row in alpaca_ds:
+            instruction = row.get("instruction", "").strip()
+            inp         = row.get("input", "").strip()
+            output      = row.get("output", "").strip()
+            if not instruction or not output:
+                skipped += 1
+                continue
+            # Drop the few impossible/safety-flagged rows already marked <nooutput>
+            # by Alpaca (e.g. "Render a 3D model of a house" → "<nooutput>").
+            # These teach the model to refuse work, which we don't want for
+            # a math assistant.
+            if output.lower() == "<nooutput>" or output.lower().startswith("<nooutput>"):
+                skipped += 1
+                continue
+            prompt = (
+                f"Instruction: {instruction}\n"
+                + (f"Input: {inp}\n" if inp else "")
+                + "Response:"
+            )
+            target = f" {output}"
+            examples.append({"source": "alpaca", "prompt": prompt, "target": target})
+            count += 1
+        print(f"[sft] Loaded {count:,} alpaca examples ({skipped:,} skipped)")
+    except Exception as exc:
+        print(f"[sft] tatsu-lab/alpaca unavailable ({exc}); skipping.")
 
-    # MATH
+    # ── open-r1/OpenR1-Math-220k ──────────────────────────────────────────
+    # R1 traces: long chain-of-thought reasoning on math problems.
+    # Covers GSM8K-level, MATH-level, and AoPS-level difficulty.
     try:
-        math_ds = MATHDataset(split="train")
-        if len(math_ds) > 0:
-            for i in range(min(len(math_ds), 5000)):
-                p, t = math_ds.format_for_sft(i)
-                examples.append({"source": "math", "prompt": p, "target": t})
-    except Exception:
-        pass
+        from datasets import load_dataset
+        openr1_ds = load_dataset(
+            "open-r1/OpenR1-Math-220k",
+            "default",
+            split="train",
+            streaming=True,
+        )
+        count = 0
+        for row in openr1_ds:
+            problem   = row.get("problem", "")
+            solution  = row.get("solution", "")
+            answer    = row.get("answer", "")
+            if not problem or not solution:
+                continue
+            prompt = f"Problem: {problem}\nSolution: <REASON>"
+            target = f"{solution}</REASON>\n<ANSWER>{answer}</ANSWER>"
+            examples.append({"source": "openr1", "prompt": prompt, "target": target})
+            count += 1
+            if count >= 50_000:
+                break
+        print(f"[sft] Loaded {count:,} openr1 examples")
+    except Exception as exc:
+        print(f"[sft] open-r1/OpenR1-Math-220k unavailable ({exc}); skipping.")
+
+    # ── camel-ai/physics ───────────────────────────────────────────────────
+    # Physics Q+A dialogues: diverse physics sub-fields (mechanics, E&M, QM,
+    # thermo, etc.). Uses <REASON>/<ANSWER> format for consistency.
+    try:
+        from datasets import load_dataset
+        physics_ds = load_dataset("camel-ai/physics", split="train", streaming=True)
+        count = 0
+        pending_user: Optional[str] = None
+        pending_field: Optional[str] = None
+        for row in physics_ds:
+            role    = str(row.get("role_type", "")).upper()
+            msg     = row.get("message", {})
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            if not content:
+                continue
+            field = str(row.get("physics_field", "unknown"))
+            if "USER" in role:
+                pending_user  = f"[Physics: {field}] {content}"
+                pending_field = field
+            elif "ASSISTANT" in role and pending_user is not None:
+                prompt = f"{pending_user}\nAnswer: <REASON>"
+                target = f"{content}</REASON>\n<ANSWER>Done</ANSWER>"
+                examples.append({"source": "physics", "prompt": prompt, "target": target})
+                pending_user = None
+                count += 1
+                if count >= 30_000:
+                    break
+        print(f"[sft] Loaded {count:,} physics examples")
+    except Exception as exc:
+        print(f"[sft] camel-ai/physics unavailable ({exc}); skipping.")
 
     return examples
 

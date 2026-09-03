@@ -1,9 +1,9 @@
 """Pretokenization pipeline for RWKV-7 math model (50M parameters).
 
 Fetches data from:
-  - open-r1/OpenR1-Math-220k  (94k math problems with R1 reasoning traces)
-  - camel-ai/physics           (physics dialogues — small dataset, fully used)
-  - HuggingFaceFW/fineweb (sample/10BT) — general English web text
+  - tokyotech-llm/swallow-math    (Japanese math problems, 40% of corpus)
+  - HuggingFaceFW/fineweb (10BT)  (general English web text, 30% of corpus)
+  - ajibawa-2023/Python-Code-Large (Python source files, Python 3 filtered, 30%)
 
 ────────────────────────────────────────────────────────────────────────────
 Compute-optimal sizing (per Chinchilla / Hoffmann et al. 2022):
@@ -12,24 +12,21 @@ Compute-optimal sizing (per Chinchilla / Hoffmann et al. 2022):
    and we want extra reasoning signal.)
 ────────────────────────────────────────────────────────────────────────────
 
-Target split: 40% math / 30% general / 30% physics
-  - OpenR1-Math-220k  → 40% × 2.0B = 800M tokens
-  - FineWeb-10BT       → 30% × 2.0B = 600M tokens
-  - camel-ai/physics   → 30% × 2.0B = 600M tokens target
+Target split: 40% math / 30% general / 30% Python code
+  - tokyotech-llm/swallow-math  → 40% × 2.0B = 800M tokens
+  - FineWeb-10BT                 → 30% × 2.0B = 600M tokens
+  - ajibawa-2023/Python-Code...  → 30% × 2.0B = 600M tokens
 
-BUT camel-ai/physics only contains ~1.5M tokens (23.5 MB compressed).
-So we use it ALL, then redistribute the surplus:
-  physics_tokens_actual  = 1.5M   (use everything)
-  surplus                = 600M − 1.5M = 598.5M
-  redistribute to OpenR1 : FineWeb in 40 : 30 ratio
-    OpenR1_extra   = 598.5M × (40/70) ≈ 342M
-    FineWeb_extra  = 598.5M × (30/70) ≈ 257M
-  Final targets:
-    OpenR1  : 800M + 342M = 1.142B tokens
-    FineWeb : 600M + 257M = 857M tokens
-    physics : 1.5M tokens  (full dataset)
+Python code is filtered to Python 3 syntax (rejects `print "foo"`,
+`class X(object):`, `u'...'`, `apply()`, `exec '...'`).
 
 ────────────────────────────────────────────────────────────────────────────
+
+NOTE: GSM8K and MATH (hendrycks/competition_math) are BENCHMARK datasets
+used only for evaluation — they must NEVER appear in training data.
+
+NOTE: open-r1/OpenR1-Math-220k and camel-ai/physics contain R1 reasoning
+traces and physics dialogues respectively; they belong in SFT, not pretrain.
 
 Tokenizes with MathTokenizer and saves as Parquet files (~512 MB each).
 Uploads to:
@@ -51,7 +48,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     import modal
@@ -74,21 +71,22 @@ CHUNK_SIZE_ESTIMATE_BYTES = 512 * 1024 * 1024  # 512 MB
 
 # ── Compute-optimal targets (see module docstring for derivation) ───────────
 TARGET_TOTAL_TOKENS = 2_000_000_000        # 2.0B tokens
-MATH_RATIO          = 0.40                 # OpenR1
+MATH_RATIO          = 0.40                 # tokyotech-llm/swallow-math
 GENERAL_RATIO       = 0.30                 # FineWeb
-PHYSICS_RATIO       = 0.30                 # camel-ai/physics
+PYTHON_CODE_RATIO   = 0.30                 # ajibawa-2023/Python-Code-Large
+# Ratios must sum to 1.0
+assert abs(MATH_RATIO + GENERAL_RATIO + PYTHON_CODE_RATIO - 1.0) < 1e-9
 
 # ── Avg tokens per document (used for pre-allocation to avoid buffering) ───
-# M2 fix: estimates must match the actual tokenizer output.
-# AVG_TOKENS reflects MathTokenizer with digit_split=True (the default).
-# With digit splitting, text containing numbers inflates by ~2–3× per digit.
-# For FineWeb prose the average inflation is ~2.0×, so native 700 → ~1400.
-# OpenR1 traces have very few inline numbers, so the multiplier is ~1.1–1.2×.
+# M2 fix: estimates match the actual MathTokenizer default (digit_split=False).
+# Without digit splitting, numbers are tokenized natively by cl100k (1 token
+# per integer of reasonable length).  If a caller enables digit_split=True
+# these estimates must be re-measured.
 AVG_TOKENS = {
-    "openr1":    29_000,   # long R1 traces, minor digit inflation
-    "fineweb":    1_400,   # typical web paragraph × 2.0× digit-split inflation
-    "physics":    1_400,   # one Q+A turn × 2.0× digit-split inflation
-    "synthetic":    60,    # arithmetic sentence (all digits → 3× inflation vs raw ~20)
+    "swallow":     25_000,   # long reasoning traces
+    "fineweb":        700,    # typical web paragraph
+    "python_code":    700,    # one Python file snippet
+    "synthetic":       20,    # arithmetic sentence
 }
 
 
@@ -96,8 +94,8 @@ AVG_TOKENS = {
 class TokenizeConfig:
     """Configuration for the pretokenization run."""
     # Source caps (in DOCUMENTS, hard upper bound)
-    max_openr1:    int = 50_000
-    max_physics:   int = 30_000
+    max_swallow:     int = 50_000
+    max_python_code: int = 500_000   # Python-Code-Large has ~2M rows; cap at 500k
     max_synthetic: int = 2_000
 
     hf_token_env: str = "HF_TOKEN"
@@ -121,17 +119,16 @@ def stream_synthetic_texts(size: int, seed: int) -> Iterator[Dict[str, str]]:
     print(f"[synthetic] Generated {size} examples.")
 
 
-def stream_openr1_texts(max_rows: int) -> Iterator[Dict[str, str]]:
-    """Stream math problems from open-r1/OpenR1-Math-220k.
+def stream_swallow_texts(max_rows: int) -> Iterator[Dict[str, str]]:
+    """Stream math problems from tokyotech-llm/swallow-math.
 
     Raises RuntimeError on failure (caller must handle).
-    Yields {"source": "openr1", "text": <problem + solution + answer>}.
+    Yields {"source": "swallow", "text": <problem + solution>}.
     """
     from datasets import load_dataset
-    print(f"[openr1] Loading stream (cap={max_rows:,} docs) ...")
+    print(f"[swallow] Loading stream (cap={max_rows:,} docs) ...")
     ds = load_dataset(
-        "open-r1/OpenR1-Math-220k",
-        "default",
+        "tokyotech-llm/swallow-math",
         split="train",
         streaming=True,
     )
@@ -139,55 +136,14 @@ def stream_openr1_texts(max_rows: int) -> Iterator[Dict[str, str]]:
     for row in ds:
         problem = row.get("problem", "")
         solution = row.get("solution", "")
-        answer = row.get("answer", "")
         if not problem or not solution:
             continue
-        text = f"Problem: {problem}\n\nSolution:\n{solution}\n\nAnswer: {answer}"
-        yield {"source": "openr1", "text": text}
+        text = f"Problem: {problem}\n\nSolution:\n{solution}"
+        yield {"source": "swallow", "text": text}
         count += 1
         if count >= max_rows:
             break
-    print(f"[openr1] Streamed {count:,} rows.")
-
-
-def stream_physics_texts(max_rows: int) -> Iterator[Dict[str, str]]:
-    """Stream ALL physics dialogues from camel-ai/physics.
-
-    Note: this dataset is small (23.5 MB, ~1.5M tokens).  We typically use
-    the full corpus; `max_rows` is only a safety bound.
-
-    Yields {"source": "physics", "text": <user + assistant>}.
-    """
-    from datasets import load_dataset
-    print(f"[physics] Loading stream (cap={max_rows:,} docs) ...")
-    ds = load_dataset("camel-ai/physics", split="train", streaming=True)
-
-    pending_user: Optional[str] = None
-    pending_field: Optional[str] = None
-    count = 0
-    total_rows = 0
-
-    for row in ds:
-        total_rows += 1
-        role = str(row.get("role_type", "")).upper()
-        msg = row.get("message", {})
-        content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-        if not content:
-            continue
-        physics_field = str(row.get("physics_field", "unknown"))
-
-        if "USER" in role:
-            pending_user = f"[Physics: {physics_field}] {content}"
-            pending_field = physics_field
-        elif "ASSISTANT" in role and pending_user is not None:
-            text = f"{pending_user}\n\nAssistant:\n{content}"
-            yield {"source": "physics", "text": text}
-            pending_user = None
-            count += 1
-            if count >= max_rows:
-                break
-
-    print(f"[physics] Streamed {count:,} dialogues from {total_rows:,} raw rows.")
+    print(f"[swallow] Streamed {count:,} rows.")
 
 
 def stream_fineweb_texts(target_tokens: int) -> Iterator[Dict[str, str]]:
@@ -230,105 +186,104 @@ def stream_fineweb_texts(target_tokens: int) -> Iterator[Dict[str, str]]:
           f"(~{accumulated_tokens:,} estimated tokens).")
 
 
+def stream_python_code_texts(max_rows: int) -> Iterator[Dict[str, str]]:
+    """Stream Python source files from ajibawa-2023/Python-Code-Large.
+
+    Applies a Python 3 filter: rows that appear to contain Python 2 syntax
+    (bare ``print`` statements, old-style classes without ``from __future__``,
+    ``u'...'`` unicode literals, etc.) are skipped.
+
+    Yields {"source": "python_code", "text": <file content>}.
+    """
+    from datasets import load_dataset
+    import re
+
+    print(f"[python_code] Loading stream (cap={max_rows:,} docs) ...")
+    ds = load_dataset(
+        "ajibawa-2023/Python-Code-Large",
+        "default",
+        split="train",
+        streaming=True,
+    )
+
+    # Python 2 detector — catches the most common patterns visible in the
+    # dataset preview (python-twitter, web2py, simplejson, etc.).
+    _PY2_PATTERNS = (
+        # Bare `print "foo"` (no parentheses) — strongest signal
+        re.compile(r'(?:^|\n)\s*print\s+["\']'),
+        # Old-style class: `class Foo(object):` — works at start-of-string
+        # or after a newline (the surrounding text in a file is preceded
+        # by a newline in the vast majority of cases).
+        re.compile(r'(?:^|\n)\s*class\s+\w+\s*\(\s*object\s*\)\s*:'),
+        # `u'...'` unicode literal (Python 2 default str)
+        re.compile(r'\bu["\']'),
+        # `apply()` builtin removed in Python 3
+        re.compile(r'\bapply\s*\('),
+        # `exec` statement (not a function)
+        re.compile(r"\bexec\s+['\"]"),
+    )
+
+    count = 0
+    passed = 0
+    for row in ds:
+        code = row.get("code", "")
+        if not code:
+            continue
+
+        # Python 3 filter: skip rows with Python 2 signals
+        is_py2 = any(pat.search(code) for pat in _PY2_PATTERNS)
+        if is_py2:
+            count += 1
+            continue
+
+        yield {"source": "python_code", "text": code}
+        passed += 1
+        count += 1
+        if count >= max_rows:
+            break
+
+    py2_pct = (count - passed) / max(count, 1) * 100
+    print(f"[python_code] Streamed {passed:,} Python-3 docs "
+          f"({py2_pct:.0f}% filtered as Python 2, {count:,} total examined).")
+
+
 # ---------------------------------------------------------------------------
-# Adaptive sampling: physics is small → use all, redistribute the rest
+# Tokenization is straightforward — each source is large enough to fill its
+# exact ratio; no redistribution needed.
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PlanOutput:
-    """Final token targets per source after adaptive redistribution."""
-    openr1_tokens:   int
-    fineweb_tokens:  int
-    physics_tokens:  int    # target (will be capped at actual)
-    physics_actual:  int    # real count after streaming
+    """Final token targets per source after compute-optimal allocation."""
+    swallow_tokens:   int
+    fineweb_tokens:   int
+    python_code_tokens: int
     synthetic_docs:   int
 
 
 def compute_adaptive_plan(
     cfg: TokenizeConfig,
-) -> Tuple[PlanOutput, Iterator[Dict[str, str]]]:
-    """Decide final token targets based on actual physics dataset size.
+) -> PlanOutput:
+    """Decide final token targets (no adaptive redistribution needed).
 
-    Strategy:
-      1. Stream physics once and count it (this is the only full pass).
-      2. Compute surplus: physics_target − physics_actual.
-      3. Redistribute surplus to OpenR1 and FineWeb in 40:30 ratio.
-      4. Return plan + the physics iterator for use by all_sources().
-
-    M3 fix: we stream physics once and pass the iterator out so callers
-    don't need to re-stream it just to count rows.
+    With three clean sources (swallow, fineweb, python_code) and no undersized
+    datasets, the base 40/30/30 split is used directly.
     """
     print("\n[plan] Computing compute-optimal targets ...")
 
-    # 1. Target tokens
-    target_math     = int(TARGET_TOTAL_TOKENS * MATH_RATIO)        # 800M
-    target_general  = int(TARGET_TOTAL_TOKENS * GENERAL_RATIO)     # 600M
-    target_physics  = int(TARGET_TOTAL_TOKENS * PHYSICS_RATIO)     # 600M
-    print(f"[plan] Base targets: OpenR1={target_math:,}  "
-          f"FineWeb={target_general:,}  physics={target_physics:,}")
+    target_swallow     = int(TARGET_TOTAL_TOKENS * MATH_RATIO)       # 800M
+    target_fineweb    = int(TARGET_TOTAL_TOKENS * GENERAL_RATIO)    # 600M
+    target_python     = int(TARGET_TOTAL_TOKENS * PYTHON_CODE_RATIO) # 600M
 
-    # 2. Stream physics once to count it (M3 fix: pass iterator out to avoid
-    #    a second load in all_sources).
-    print("[plan] Streaming physics to count rows ...")
-    from datasets import load_dataset
-    physics_ds = load_dataset("camel-ai/physics", split="train", streaming=True)
+    print(f"[plan] Targets: swallow={target_swallow:,}  "
+          f"FineWeb={target_fineweb:,}  python_code={target_python:,}")
 
-    physics_count = 0
-    sample_texts: List[str] = []
-    # Buffer a small prefix for display
-    prefix_rows: List[Any] = []
-    for row in physics_ds:
-        physics_count += 1
-        if len(prefix_rows) < 10:
-            msg = row.get("message", {})
-            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
-            prefix_rows.append(content[:80])
-        if physics_count >= cfg.max_physics:
-            break
-
-    physics_actual_tokens = physics_count * AVG_TOKENS["physics"]
-    print(f"[plan] Physics: {physics_count:,} dialogues (capped at {cfg.max_physics:,}), "
-          f"~{physics_actual_tokens:,} estimated tokens")
-    if prefix_rows:
-        print(f"[plan] Sample physics texts:")
-        for s in prefix_rows[:3]:
-            print(f"         {s!r}")
-
-    # 3. Compute surplus and redistribute
-    if physics_actual_tokens < target_physics:
-        surplus = target_physics - physics_actual_tokens
-        # redistribute 40:30 between OpenR1 and FineWeb
-        openr1_extra  = int(surplus * (MATH_RATIO /
-                                       (MATH_RATIO + GENERAL_RATIO)))
-        fineweb_extra = surplus - openr1_extra
-        final_math    = target_math + openr1_extra
-        final_general = target_general + fineweb_extra
-        final_physics = physics_actual_tokens
-        print(f"[plan] Physics undersized. Surplus={surplus:,}")
-        print(f"[plan]   → OpenR1 : {target_math:,} + {openr1_extra:,} "
-              f"= {final_math:,}")
-        print(f"[plan]   → FineWeb: {target_general:,} + {fineweb_extra:,} "
-              f"= {final_general:,}")
-        print(f"[plan]   → physics: {final_physics:,} (full)")
-    else:
-        final_math    = target_math
-        final_general = target_general
-        final_physics = target_physics
-        print(f"[plan] Physics meets target. No redistribution.")
-
-    plan = PlanOutput(
-        openr1_tokens=final_math,
-        fineweb_tokens=final_general,
-        physics_tokens=final_physics,
-        physics_actual=physics_actual_tokens,
+    return PlanOutput(
+        swallow_tokens=target_swallow,
+        fineweb_tokens=target_fineweb,
+        python_code_tokens=target_python,
         synthetic_docs=cfg.max_synthetic,
     )
-
-    # M3 fix: re-stream physics once and return the iterator.
-    # all_sources() will use this instead of calling stream_physics_texts().
-    physics_stream = stream_physics_texts(cfg.max_physics)
-
-    return plan, physics_stream
 
 
 # ---------------------------------------------------------------------------
@@ -541,21 +496,27 @@ def upload_to_hub(
         "repo_id":       repo_id,
         "total_chunks":  len(chunk_paths),
         "target_total_tokens": TARGET_TOTAL_TOKENS,
-        "split_ratios":  {"openr1": MATH_RATIO, "fineweb": GENERAL_RATIO,
-                          "physics": PHYSICS_RATIO},
+        "split_ratios":  {
+            "swallow":     MATH_RATIO,
+            "fineweb":     GENERAL_RATIO,
+            "python_code": PYTHON_CODE_RATIO,
+        },
         "plan": {
-            "openr1_tokens":  plan.openr1_tokens,
-            "fineweb_tokens": plan.fineweb_tokens,
-            "physics_tokens": plan.physics_tokens,
-            "physics_actual": plan.physics_actual,
-            "synthetic_docs": plan.synthetic_docs,
+            "swallow_tokens":     plan.swallow_tokens,
+            "fineweb_tokens":     plan.fineweb_tokens,
+            "python_code_tokens": plan.python_code_tokens,
+            "synthetic_docs":    plan.synthetic_docs,
         },
         "avg_tokens_per_doc": AVG_TOKENS,
         "sources": {
-            "openr1":    "open-r1/OpenR1-Math-220k (default split)",
-            "physics":   "camel-ai/physics (full dataset)",
-            "fineweb":   "HuggingFaceFW/fineweb (sample-10BT)",
-            "synthetic": "SyntheticMathDataset (seed=42, max_digits=3)",
+            "swallow":     "tokyotech-llm/swallow-math (train split)",
+            "fineweb":     "HuggingFaceFW/fineweb (sample-10BT)",
+            "python_code": "ajibawa-2023/Python-Code-Large (Python 3 filtered, max 500k docs)",
+            "synthetic":   "SyntheticMathDataset (seed=42, max_digits=3)",
+        },
+        "benchmarks": {
+            "note": "GSM8K and MATH (hendrycks/competition_math) are EVALUATION benchmarks only. "
+                    "They must NEVER be used in any training data.",
         },
     }
     manifest_path = LOCAL_DATA_DIR / "manifest.json"
@@ -589,7 +550,7 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
     print(f"HF repo          : {HF_REPO_ID}")
     print(f"Target total     : {TARGET_TOTAL_TOKENS / 1e9:.2f}B tokens")
     print(f"Split (target)   : math={MATH_RATIO*100:.0f}% "
-          f"general={GENERAL_RATIO*100:.0f}% physics={PHYSICS_RATIO*100:.0f}%")
+          f"general={GENERAL_RATIO*100:.0f}% python_code={PYTHON_CODE_RATIO*100:.0f}%")
     print()
 
     # 1. Validate HF token
@@ -601,38 +562,36 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
     tokenizer = build_tokenizer()
     print(f"[tokenizer] vocab={tokenizer.n_vocab}\n")
 
-    # 3. Compute adaptive plan (also gives us a physics stream to avoid M3 double-load)
-    plan, physics_stream = compute_adaptive_plan(cfg)
+    # 3. Compute plan (no adaptive redistribution needed with clean sources)
+    plan = compute_adaptive_plan(cfg)
 
     # 4. Build source iterators + target dict + cap dict
     targets = {
-        "openr1":   plan.openr1_tokens,
-        "fineweb":  plan.fineweb_tokens,
-        "physics":  plan.physics_tokens,
+        "swallow":     plan.swallow_tokens,
+        "fineweb":     plan.fineweb_tokens,
+        "python_code": plan.python_code_tokens,
     }
     caps = {
-        "openr1":   cfg.max_openr1,
-        "physics":  cfg.max_physics,    # safety
-        "fineweb":  docs_for_tokens(plan.fineweb_tokens, "fineweb"),
+        "swallow":     cfg.max_swallow,
+        "python_code": cfg.max_python_code,
+        "fineweb":     docs_for_tokens(plan.fineweb_tokens, "fineweb"),
     }
     print(f"\n[plan] Document caps: {caps}")
 
     # 5. Build full source iterator (synthetic first, no cuts)
-    # M3 fix: physics_stream is yielded by compute_adaptive_plan() so we
-    # stream it only once rather than loading it twice.
-    def all_sources(physics_stream_arg):
+    def all_sources():
         # Synthetic always included, no token cap (only 2000 docs total)
         yield from stream_synthetic_texts(cfg.max_synthetic, seed=42)
-        # Physics stream already counted and streamed by compute_adaptive_plan
-        yield from physics_stream_arg
-        # OpenR1 — up to cfg.max_openr1 docs
-        yield from stream_openr1_texts(cfg.max_openr1)
+        # Swallow-math — up to max_swallow docs
+        yield from stream_swallow_texts(cfg.max_swallow)
+        # Python code — up to max_python_code docs, Python 3 filtered
+        yield from stream_python_code_texts(cfg.max_python_code)
         # FineWeb — streams until target_tokens hit
         yield from stream_fineweb_texts(plan.fineweb_tokens)
 
     # 6. Tokenize + write parquet
     print("\n[tokenize] Starting tokenization ...")
-    token_iter = tokenize_iterator(all_sources(physics_stream), tokenizer, targets, caps)
+    token_iter = tokenize_iterator(all_sources(), tokenizer, targets, caps)
     chunk_paths = write_parquet_chunks(
         token_iter, cfg.output_dir,
         cfg.rows_per_chunk, cfg.chunk_size_estimate,
@@ -687,14 +646,14 @@ if is_modal:
         retries=modal.Retries(max_retries=2),
     )
     def upload_pretokenized(
-        max_openr1: int = 50_000,
-        max_physics: int = 30_000,
+        max_swallow: int = 50_000,
+        max_python_code: int = 500_000,
         max_synthetic: int = 2_000,
     ):
         """Run pretokenization on a 32-CPU Modal VM and upload to HF Hub."""
         cfg = TokenizeConfig(
-            max_openr1=max_openr1,
-            max_physics=max_physics,
+            max_swallow=max_swallow,
+            max_python_code=max_python_code,
             max_synthetic=max_synthetic,
             output_dir=Path("/tmp/parquet_chunks"),
         )
@@ -708,15 +667,15 @@ if is_modal:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-openr1", type=int, default=50_000)
-    parser.add_argument("--max-physics", type=int, default=30_000)
+    parser.add_argument("--max-swallow", type=int, default=50_000)
+    parser.add_argument("--max-python-code", type=int, default=500_000)
     parser.add_argument("--max-synthetic", type=int, default=2_000)
     parser.add_argument("--local", action="store_true")
     args = parser.parse_args()
 
     cfg = TokenizeConfig(
-        max_openr1=args.max_openr1,
-        max_physics=args.max_physics,
+        max_swallow=args.max_swallow,
+        max_python_code=args.max_python_code,
         max_synthetic=args.max_synthetic,
     )
 
@@ -724,7 +683,6 @@ if __name__ == "__main__":
         run_tokenize(cfg)
     else:
         upload_pretokenized.remote(
-            max_openr1=cfg.max_openr1,
-            max_physics=cfg.max_physics,
+            max_swallow=cfg.max_swallow,
             max_synthetic=cfg.max_synthetic,
         )

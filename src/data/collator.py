@@ -98,6 +98,10 @@ class RWKVCollator:
         input_ids = self.encode_batch(texts)
         # Labels = input_ids (next-token prediction)
         labels = input_ids.clone()
+        # Mask padding positions with -100 so cross_entropy ignores them.
+        # Without this, the loss trains on predicting pad tokens, which
+        # causes NaN gradients and degrades convergence.
+        labels[labels == self.tokenizer.pad_id] = -100
         return {"input_ids": input_ids, "labels": labels}
 
 

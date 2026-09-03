@@ -79,7 +79,12 @@ class MathTokenizer:
         vocab_size: Target vocabulary size (default 32768).
         base: Base tokenizer name. Default "cl100k_base" via tiktoken.
         special_tokens: Custom special tokens to add.
-        digit_split: If True, split numbers digit-by-digit (default True).
+        digit_split: If True, split numbers digit-by-digit (default False).
+            Default is False because cl100k already tokenizes digits
+            individually and digit splitting bloats token count 2.75× with
+            no arithmetic benefit (the model still sees individual digits
+            through the BPE encoding of each numeric token).  Enable only
+            if you specifically need digit-level supervision signals.
         add_special: If True, prepend <BOS> on encode.
     """
 
@@ -88,7 +93,7 @@ class MathTokenizer:
         vocab_size: int = 32768,
         base: str = "cl100k_base",
         special_tokens: Sequence[str] = SPECIAL_TOKENS,
-        digit_split: bool = True,
+        digit_split: bool = False,
         add_special: bool = False,
     ):
         import tiktoken
@@ -183,9 +188,12 @@ class MathTokenizer:
         if add_special is None:
             add_special = self.add_special
 
-        # Step 1: split on math markers BEFORE BPE so each marker is a
-        # distinct token that we can replace with a single reserved ID.
-        parts = self._split_on_markers(text)
+        # Step 1: preprocess FIRST so digit-split markers (<NUM>, <NEG>,
+        # <DECIMAL>) are inserted into the text.  Then split on ALL
+        # markers — pre-existing ones (<REASON>, <ANSWER>, etc.) and
+        # the ones we just created.
+        preprocessed = self._preprocess(text)
+        parts = self._split_on_markers(preprocessed)
 
         result: List[int] = []
         for part in parts:
@@ -193,11 +201,9 @@ class MathTokenizer:
                 # This is a full special token like "<NUM>" or "<REASON>".
                 result.append(self.special_to_id[part])
             else:
-                # Step 2: preprocess (digit-split) on non-marker text
-                preprocessed = self._preprocess(part)
                 # Step 3: BPE encode
                 base_ids = self.base_encoder.encode(
-                    preprocessed, allowed_special="all"
+                    part, allowed_special="all"
                 )
                 # Step 4: remap OOB base tokens to overflow buckets
                 for tok_id in base_ids:
@@ -292,7 +298,8 @@ class StubTokenizer:
         self.special_to_id = {t: self.vocab_size - len(self.special_tokens) + i
                              for i, t in enumerate(self.special_tokens)}
         self.id_to_special = {v: k for k, v in self.special_to_id.items()}
-        self.digit_split = True
+        # Default to no digit splitting; tests can enable explicitly.
+        self.digit_split = False
         self._num_re = re.compile(r"-?\d+(?:\.\d+)?")
 
     def _build_vocab(self):
@@ -370,15 +377,16 @@ class StubTokenizer:
         if add_special is None:
             add_special = self.add_special
 
-        # Split on markers first, then preprocess + char-tokenize each part
-        parts = self._split_on_markers(text)
+        # Preprocess FIRST so digit-split markers are inserted, then split
+        # on all markers.  Matches MathTokenizer.encode() ordering.
+        preprocessed = self._preprocess(text)
+        parts = self._split_on_markers(preprocessed)
         ids = []
         for part in parts:
             if part in self.special_to_id:
                 ids.append(self.special_to_id[part])
             else:
-                preprocessed = self._preprocess(part)
-                for ch in preprocessed:
+                for ch in part:
                     ids.append(self._char_to_id.get(ch, ord("?")))
         if add_special:
             ids = [self.bos_id] + ids

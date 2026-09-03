@@ -32,9 +32,32 @@ def stub():
 
 
 @pytest.fixture
+def stub_digit_split():
+    """Stub tokenizer with digit_split=True (legacy default).
+
+    The 5 marker-emission tests (TestDigitSplit, TestNegativeNumbers,
+    TestDecimals) were written when digit_split defaulted to True. The
+    project's current default is False (see test_tokenizer_fixes.py for
+    rationale — 2.75× token bloat avoided). Use this fixture to opt back
+    into the legacy behavior for those specific assertions.
+    """
+    t = StubTokenizer(vocab_size=512)
+    t.digit_split = True
+    return t
+
+
+@pytest.fixture
 def real():
     """Real tiktoken-backed tokenizer."""
     return MathTokenizer(vocab_size=32768)
+
+
+@pytest.fixture
+def real_digit_split():
+    """Real tiktoken-backed tokenizer with digit_split=True."""
+    t = MathTokenizer(vocab_size=32768)
+    t.digit_split = True
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -139,10 +162,10 @@ class TestDigitSplit:
         ]
         assert len(digit_tokens) >= 3
 
-    def test_special_marker_for_number(self, stub):
-        """123 contains <NUM> marker."""
-        ids = stub.encode("123")
-        num_ids = [t for t in ids if t == stub.special_to_id["<NUM>"]]
+    def test_special_marker_for_number(self, stub_digit_split):
+        """123 contains <NUM> marker (with digit_split=True)."""
+        ids = stub_digit_split.encode("123")
+        num_ids = [t for t in ids if t == stub_digit_split.special_to_id["<NUM>"]]
         assert len(num_ids) >= 1, "Expected <NUM> marker in encoding of 123"
 
 
@@ -151,19 +174,19 @@ class TestDigitSplit:
 # ---------------------------------------------------------------------------
 
 class TestNegativeNumbers:
-    """Negative numbers use <NEG> marker."""
+    """Negative numbers use <NEG> marker (with digit_split=True)."""
 
-    def test_negative_uses_neg_marker(self, stub):
-        """-5 contains <NEG> marker."""
-        ids = stub.encode("-5")
-        neg_ids = [t for t in ids if t == stub.special_to_id["<NEG>"]]
+    def test_negative_uses_neg_marker(self, stub_digit_split):
+        """-5 contains <NEG> marker (with digit_split=True)."""
+        ids = stub_digit_split.encode("-5")
+        neg_ids = [t for t in ids if t == stub_digit_split.special_to_id["<NEG>"]]
         assert len(neg_ids) == 1
 
-    def test_negative_decimal_uses_both_markers(self, stub):
-        """-3.14 contains <NEG> and <DECIMAL> markers."""
-        ids = stub.encode("-3.14")
-        neg_ids = [t for t in ids if t == stub.special_to_id["<NEG>"]]
-        dec_ids = [t for t in ids if t == stub.special_to_id["<DECIMAL>"]]
+    def test_negative_decimal_uses_both_markers(self, stub_digit_split):
+        """-3.14 contains <NEG> and <DECIMAL> markers (with digit_split=True)."""
+        ids = stub_digit_split.encode("-3.14")
+        neg_ids = [t for t in ids if t == stub_digit_split.special_to_id["<NEG>"]]
+        dec_ids = [t for t in ids if t == stub_digit_split.special_to_id["<DECIMAL>"]]
         assert len(neg_ids) == 1
         assert len(dec_ids) == 1
 
@@ -173,18 +196,18 @@ class TestNegativeNumbers:
 # ---------------------------------------------------------------------------
 
 class TestDecimals:
-    """Decimals use <DECIMAL> marker."""
+    """Decimals use <DECIMAL> marker (with digit_split=True)."""
 
-    def test_decimal_uses_marker(self, stub):
-        """3.14 contains <DECIMAL>."""
-        ids = stub.encode("3.14")
-        dec_ids = [t for t in ids if t == stub.special_to_id["<DECIMAL>"]]
+    def test_decimal_uses_marker(self, stub_digit_split):
+        """3.14 contains <DECIMAL> (with digit_split=True)."""
+        ids = stub_digit_split.encode("3.14")
+        dec_ids = [t for t in ids if t == stub_digit_split.special_to_id["<DECIMAL>"]]
         assert len(dec_ids) == 1
 
-    def test_integer_no_decimal_marker(self, stub):
-        """123 has NO <DECIMAL> marker."""
-        ids = stub.encode("123")
-        dec_ids = [t for t in ids if t == stub.special_to_id["<DECIMAL>"]]
+    def test_integer_no_decimal_marker(self, stub_digit_split):
+        """123 has NO <DECIMAL> marker (with digit_split=True)."""
+        ids = stub_digit_split.encode("123")
+        dec_ids = [t for t in ids if t == stub_digit_split.special_to_id["<DECIMAL>"]]
         assert len(dec_ids) == 0
 
 
@@ -332,14 +355,9 @@ class TestRealTokenizer:
             decoded = real.decode(ids)
             assert isinstance(decoded, str)
 
-    def test_real_digit_split(self, real):
-        """Real tokenizer splits numbers digit-by-digit."""
-        ids = real.encode("12345")
-        # No single token should be "12345"
-        decoded = real.decode(ids)
-        # Each digit should appear as a separate character
-        # Check that "12345" doesn't appear as a single substring in decode
-        # (this is hard to test directly; check token count instead)
+    def test_real_digit_split(self, real_digit_split):
+        """Real tokenizer with digit_split=True splits numbers digit-by-digit."""
+        ids = real_digit_split.encode("12345")
         # 12345 -> <NUM> 1 2 3 4 5 -> 1 marker + 5 digits = 6 tokens minimum
         assert len(ids) >= 6
 
