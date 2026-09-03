@@ -8,7 +8,9 @@ pytest-cov>=4.1.0
 pyyaml>=6.0
 huggingface-hub>=0.20.0
 safetensors>=0.4.0
+pyarrow>=14.0.0
 # Optional
 wandb>=0.15.0
 modal>=0.50.0
 trackio>=0.1.0
+zstandard>=0.21.0

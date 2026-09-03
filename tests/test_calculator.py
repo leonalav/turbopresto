@@ -154,3 +154,62 @@ class TestColumnCoT:
     def test_multiplication_single_digit(self):
         out = column_cot_multiplication(6, 7)
         assert "Result: 42" in out
+
+
+# ---------------------------------------------------------------------------
+# try_call: multi-call iteration (added after the fix for the
+# "single search, only first call resolved" path)
+# ---------------------------------------------------------------------------
+
+class TestTryCallMultiIteration:
+    """After the fix, ``try_call`` resolves every ``<TOOL>calc(...)</TOOL>``
+    block in left-to-right order rather than only the first.  These tests
+    pin the new behaviour while keeping the legacy single-call contract
+    intact (``no_call`` / ``ok`` for the happy paths)."""
+
+    def test_two_calls_left_to_right(self):
+        text = (
+            "step1: <TOOL>calc(2+3)</TOOL>, "
+            "step2: <TOOL>calc(10*4)</TOOL>"
+        )
+        new, status = try_call(text)
+        assert status == "ok"
+        assert new == "step1: 5, step2: 40"
+        assert "<TOOL>" not in new
+
+    def test_three_calls(self):
+        text = (
+            "<TOOL>calc(100-25)</TOOL> "
+            "<TOOL>calc(75/3)</TOOL> "
+            "<TOOL>calc(25+1)</TOOL>"
+        )
+        new, status = try_call(text)
+        assert status == "ok"
+        assert new == "75 25 26"
+
+    def test_no_call_still_status_no_call(self):
+        # The "no_call" status is the legacy contract for input that has
+        # no tool calls -- verify we preserved it after the loop refactor.
+        text = "just plain text"
+        new, status = try_call(text)
+        assert status == "no_call"
+        assert new == text
+
+    def test_error_status_on_bad_expression(self):
+        # Underscore triggers the calculator's safety rejection.
+        text = "<TOOL>calc(foo_bar)</TOOL>"
+        new, status = try_call(text)
+        assert status == "error"
+        assert new == text  # original returned unchanged
+
+    def test_error_does_not_drop_earlier_resolved_call(self):
+        # First call resolves to a benign integer; second fails.
+        # We should keep the first resolution and report "error".
+        text = "<TOOL>calc(1+1)</TOOL> then <TOOL>calc(bad_thing)</TOOL>"
+        new, status = try_call(text)
+        assert status == "error"
+        # First call's "2" should remain spliced in even though the
+        # second errored.
+        assert "2" in new
+        # The failing call should still be present (unresolved).
+        assert "<TOOL>calc(bad_thing)</TOOL>" in new

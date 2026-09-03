@@ -227,27 +227,72 @@ def call_calculator(expr: str) -> str:
 def try_call(text: str) -> Tuple[str, str]:
     """If `text` contains a tool call, replace it with the result.
 
+    Iterates over every ``<TOOL>calc(...)</TOOL>`` block in ``text`` and
+    resolves them in left-to-right order.  Each iteration evaluates one
+    call and splices its numeric result in; we then rescan the spliced
+    text so a subsequent call (whose expression may itself contain a
+    numeral produced by a previous call, in principle) can be caught.
+
+    A bounded number of iterations (``MAX_TOOL_CALLS_PER_PASS = 64``)
+    prevents a pathological malformed string from pinning generation on
+    an infinite loop.  We also defend against a stuck iteration: if two
+    consecutive passes splice identical text (e.g. the regex finds an
+    always-present tool call for some reason), we bail with status
+    ``"stuck"`` rather than spinning forever.
+
+    This is the simpler of two viable strategies and is what ``RWKVGenerator``
+    uses today (see ``src/inference/generation.py``).  The other strategy --
+    pause generation when ``</TOOL>`` closes, evaluate, inject the result as
+    real tokens, and resume the recurrent state -- is currently out of scope
+    and noted as a known limitation in that module.  Iterating over all
+    calls rather than only the first already fixes the most common
+    failure mode: a multi-step CoT that ends with a tool call no longer
+    drops intermediate calls.
+
     Args:
-        text: Generated text possibly containing <TOOL>calc(...)</TOOL>.
+        text: Generated text possibly containing ``<TOOL>calc(...)</TOOL>``.
 
     Returns:
-        (new_text, status) where status is:
-          - "no_call"  — no <TOOL> block present
-          - "ok"       — tool call found and executed successfully
-          - "error"    — tool call present but evaluation failed
+        (new_text, status) where status is one of:
+          - "no_call"  -- no ``<TOOL>`` block was ever present
+          - "ok"       -- every ``<TOOL>`` block was found and executed
+          - "error"    -- a tool call was found but evaluation failed;
+                          earlier successful calls (if any) are kept,
+                          the failing text is returned as-is, and an
+                          evaluation error is signalled
+          - "stuck"    -- the bounded loop hit ``MAX_TOOL_CALLS_PER_PASS``
+                          without making further progress on the final
+                          pass (should never happen on real text but
+                          guards against adversarial input)
     """
-    found = extract_tool_call(text)
-    if found is None:
-        return text, "no_call"
-    tool, expr, start, end = found
-    if tool != "calc":
-        return text, "error"
-    try:
-        result = call_calculator(expr)
-    except CalculatorError:
-        return text, "error"
-    new_text = text[:start] + result + text[end:]
-    return new_text, "ok"
+    MAX_TOOL_CALLS_PER_PASS = 64
+    current = text
+    # Fast path: no tool call at all.
+    if extract_tool_call(current) is None:
+        return current, "no_call"
+
+    for _ in range(MAX_TOOL_CALLS_PER_PASS):
+        found = extract_tool_call(current)
+        if found is None:
+            return current, "ok"
+        _tool, _expr, start, end = found
+        try:
+            result = call_calculator(_expr)
+        except CalculatorError:
+            # We had at least one tool call (we checked above), but this
+            # particular one failed.  Return whatever ``current`` looks
+            # like now (which may include earlier successful resolutions)
+            # with status ``"error"``.  For the very-first-iteration case
+            # this is unchanged from the legacy contract.
+            return current, "error"
+        new_current = current[:start] + result + current[end:]
+        if new_current == current:
+            # Made no progress -- guard against infinite loop.
+            return current, "stuck"
+        current = new_current
+    # Hit the bounded maximum without running out of calls -- defend
+    # against adversarial inputs.
+    return current, "stuck"
 
 
 # ---------------------------------------------------------------------------

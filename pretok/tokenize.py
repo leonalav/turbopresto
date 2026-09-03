@@ -251,27 +251,29 @@ def compute_adaptive_plan(cfg: TokenizeConfig) -> PlanOutput:
     print("\n[plan] Computing compute-optimal targets ...")
 
     # 1. Target tokens
-    target_math    = int(TARGET_TOTAL_TOKENS * MATH_RATIO)        # 800M
-    target_general = int(TARGET_TOTAL_TOKENS * GENERAL_RATIO)     # 600M
-    target_physics = int(TARGET_TOTAL_TOKENS * PHYSICS_RATIO)     # 600M
+    target_math     = int(TARGET_TOTAL_TOKENS * MATH_RATIO)        # 800M
+    target_general  = int(TARGET_TOTAL_TOKENS * GENERAL_RATIO)     # 600M
+    target_physics  = int(TARGET_TOTAL_TOKENS * PHYSICS_RATIO)     # 600M
     print(f"[plan] Base targets: OpenR1={target_math:,}  "
           f"FineWeb={target_general:,}  physics={target_physics:,}")
 
-    # 2. Estimate physics size by streaming
+    # 2. Estimate physics size by sampling a bounded prefix via .take(N).
+    #    This is a single pass over a small slice of the corpus instead of
+    #    a full re-stream just to count rows.
     print("[plan] Estimating actual physics dataset size ...")
-    physics_actual_tokens = 0
-    physics_count = 0
-    sample_texts = []
-    for record in stream_physics_texts(cfg.max_physics):
-        physics_count += 1
-        # rough estimate
-        physics_actual_tokens += AVG_TOKENS["physics"]
-        # Capture first 10 for verification
-        if len(sample_texts) < 10:
-            sample_texts.append(record["text"][:80])
+    from datasets import load_dataset
+    physics_ds = load_dataset("camel-ai/physics", split="train", streaming=True)
+    # .take() returns a generator; consume it once into a list.
+    # cfg.max_physics is the same safety bound used in all_sources().
+    physics_sample = list(physics_ds.take(cfg.max_physics))
+    physics_count = len(physics_sample)
+    physics_actual_tokens = physics_count * AVG_TOKENS["physics"]
+    sample_texts = [r.get("message", {}).get("content", "")[:80]
+                    for r in physics_sample[:10]
+                    if r.get("message")]
 
-    print(f"[plan] Physics: {physics_count:,} dialogues, "
-          f"~{physics_actual_tokens:,} tokens")
+    print(f"[plan] Physics: {physics_count:,} dialogues (capped at {cfg.max_physics:,}), "
+          f"~{physics_actual_tokens:,} estimated tokens")
     if sample_texts:
         print(f"[plan] Sample physics texts:")
         for s in sample_texts[:3]:
@@ -347,11 +349,12 @@ def tokenize_iterator(
         source = record["source"]
         # Skip sources not in target plan (e.g. synthetic)
         if source not in targets:
+            tokens = tokenizer.encode(record["text"], add_special=False)
             yield {
                 "source":   source,
                 "text":     record["text"],
-                "tokens":   tokenizer.encode(record["text"], add_special=False),
-                "n_tokens": 0,  # filled below
+                "tokens":   tokens,
+                "n_tokens": len(tokens),
             }
             continue
 

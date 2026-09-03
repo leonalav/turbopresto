@@ -5,6 +5,19 @@ grade-school math word problems. Format:
 - question: natural language problem
 - answer: chain-of-thought reasoning ending with #### <number>
 
+The native HuggingFace ``gsm8k/main`` answer field also embeds inline
+calculator annotations of the form ``<<expr=result>>`` next to every
+arithmetic step (e.g. ``She has <<16-3-4=9>>9 apples``).  These are the
+dataset's own way of marking a step that should be offloaded to a
+calculator.
+
+Without rewriting them, the model is supervised to predict the literal
+substring ``9`` straight out of the CoT, which re-introduces the exact
+multi-digit-arithmetic failure mode that the
+``<TOOL>calc(...)</TOOL>`` + ``column_cot_*`` machinery was built to
+prevent.  See ``format_for_sft`` / ``format_for_pretrain`` below for the
+conversion pass.
+
 For training:
 - Pretraining: use the raw text (questions + answers concatenated)
 - SFT: format as <REASON>...cot...</REASON><ANSWER>number</ANSWER>
@@ -19,6 +32,62 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from src.utils.math_verify import extract_gsm8k_answer
+
+
+# Matches a GSM8K calculator annotation: ``<<expr=result>>`` (optionally
+# followed by a short bare numeric token, which is what GSM8K actually
+# emits -- the closed-form ``<<expr=result>>RES`` where ``RES`` is the
+# same digit(s) repeated literally in the surrounding prose so that a
+# non-tool-reading model can still see it).
+#
+# Capture groups:
+#   expr:     everything between ``<<`` and ``=`` (the expression)
+#   after:    optional bare numeric token immediately after ``>>``;
+#             we drop this to avoid teaching the model to both emit the
+#             tool call *and* memorise the result verbatim.
+_GSM8K_CALC_RE = re.compile(
+    r"<<\s*(?P<expr>[^=\n]+?)\s*=\s*[^\n]*?>>(?P<after>\s*-?\d+(?:\.\d+)?)?"
+)
+
+
+def _convert_one(match: re.Match) -> str:
+    expr = match.group("expr").strip()
+    # When there is no trailing numeric token we keep the conversion
+    # loss-less: the annotation is a one-for-one swap.  When there *is*
+    # a trailing numeric token we additionally drop it; otherwise the
+    # supervised target would still contain the dataset's known result,
+    # which is exactly the "model predicts raw multi-digit sums" failure
+    # mode this conversion is here to prevent.
+    return f"<TOOL>calc({expr})</TOOL>"
+
+
+def convert_gsm8k_calc_annotations(text: str) -> str:
+    """Convert GSM8K ``<<expr=result>>`` annotations to ``<TOOL>calc(expr)</TOOL>``.
+
+    The native GSM8K answer field marks every arithmetic step with an
+    inline ``<<expr=result>>`` annotation, with the model supposed to
+    emit a short numeric token (typically the same value as ``result``)
+    that follows the closing ``>>``.  At training time we want those
+    steps to flow through the project's ``<TOOL>calc(...)</TOOL>``
+    machinery so the calculator/column-CoT fixes actually reach the
+    data we're training on, *and* we want the supervised target to teach
+    the model to emit the tool call rather than predict the digit
+    string verbatim.
+
+    The dataset repeats the result as ``result`` inside the annotation
+    *and* as the literal token that follows -- we drop both.  When the
+    annotation has no following token (rare; happens in some synthetic
+    variants), the conversion is a one-for-one swap and no other text
+    is affected.
+
+    Args:
+        text: A GSM8K answer (or CoT) string.
+
+    Returns:
+        The same string with each ``<<expr=result>>[RES]`` replaced by
+        ``<TOOL>calc(expr)</TOOL>``.
+    """
+    return _GSM8K_CALC_RE.sub(_convert_one, text)
 
 
 class GSM8KDataset:
@@ -106,13 +175,34 @@ class GSM8KDataset:
         """Extract the final numerical answer (after ####)."""
         return extract_gsm8k_answer(self.examples[idx]["answer"])
 
-    def format_for_pretrain(self, idx: int) -> str:
-        """Format for pre-training: question + answer concatenated."""
-        ex = self.examples[idx]
-        return f"Question: {ex['question']}\nAnswer: {ex['answer']}"
+    def format_for_pretrain(self, idx: int, convert_calc_annotations: bool = True
+                            ) -> str:
+        """Format for pre-training: question + answer concatenated.
 
-    def format_for_sft(self, idx: int) -> Tuple[str, str]:
+        If ``convert_calc_annotations`` is True (default), each
+        ``<<expr=result>>`` annotation in the answer is rewritten to
+        ``<TOOL>calc(expr)</TOOL>`` so the calculator machinery is
+        supervised on real GSM8K text.
+        """
+        ex = self.examples[idx]
+        answer = ex["answer"]
+        if convert_calc_annotations:
+            answer = convert_gsm8k_calc_annotations(answer)
+        return f"Question: {ex['question']}\nAnswer: {answer}"
+
+    def format_for_sft(self, idx: int, convert_calc_annotations: bool = True
+                       ) -> Tuple[str, str]:
         """Format for SFT: prompt and target with CoT structure.
+
+        If ``convert_calc_annotations`` is True (default), each
+        ``<<expr=result>>`` annotation in the CoT is rewritten to
+        ``<TOOL>calc(expr)</TOOL>`` so the calculator/column-CoT
+        machinery the rest of the repo is built around actually reaches
+        the benchmark we're training on.  Without this conversion the
+        raw multi-digit-arithmetic substring that follows the ``>>``
+        gets used as the supervised target verbatim, which re-creates
+        the carry-direction failure mode the calculator was built to
+        fix.
 
         Returns:
             (prompt, target) where target contains reasoning and final answer.
@@ -124,6 +214,8 @@ class GSM8KDataset:
         )
         # Extract CoT (everything before ####) and final answer
         full_answer = ex["answer"]
+        if convert_calc_annotations:
+            full_answer = convert_gsm8k_calc_annotations(full_answer)
         if "####" in full_answer:
             cot_part, final_part = full_answer.split("####", 1)
             cot = cot_part.strip()
@@ -138,8 +230,13 @@ class GSM8KDataset:
         )
         return prompt, target
 
-    def format_for_grpo(self, idx: int) -> Tuple[str, str]:
+    def format_for_grpo(self, idx: int, convert_calc_annotations: bool = True
+                      ) -> Tuple[str, str]:
         """Format for GRPO: prompt and gold answer (no CoT).
+
+        ``convert_calc_annotations`` is unused here (the gold answer is
+        just the final number), but the flag is accepted for symmetry
+        with ``format_for_sft`` / ``format_for_pretrain``.
 
         Returns:
             (prompt, gold_answer) — model generates full response.

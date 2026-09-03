@@ -260,9 +260,24 @@ class RWKV7TimeMix(nn.Module):
 
         # Projections
         r = self.receptance(xr)
-        w_raw = -(self.w0 + torch.tanh(xw @ self.w1) @ self.w2)
-        # softplus(-w_raw) - 0.5 < 0, so w = exp(-exp(softplus(-w_raw) - 0.5)) ∈ (0, 1)
-        # Equivalent to canonical: -F.softplus(-(w0 + tanh(...) @ w2)) - 0.5
+        # Canonical RWKV-7 decay (BlinkDL/RWKV-LM RWKV-v7): the per-channel
+        # raw decay is
+        #     w_raw = w0 + tanh(x_w @ w1) @ w2
+        # and the multiplicative decay used by the WKV operator is
+        #     w = -softplus(-w_raw) - 0.5
+        # The soft-clamp into (-inf, -0.5) -> (-0.5, 0) after exp(-exp(.))
+        # keeps ``w`` in a numerically stable sub-range without ever
+        # saturating to exactly 0 (which would zero out the state).
+        #
+        # Earlier revisions of this file computed ``w_raw = -(...)`` first,
+        # which is equivalent at t=0 (where w0, w2 are zero-initialised) but
+        # inverts the gradient sign of the LoRA output once the weights
+        # move away from zero.  In a from-scratch run the network can
+        # absorb this by sign-flipped weights; the moment a pretrained
+        # BlinkDL checkpoint is adapted it would silently produce a
+        # mirrored decay schedule.  Keeping the canonical sign here is
+        # the correct fix.
+        w_raw = self.w0 + torch.tanh(xw @ self.w1) @ self.w2
         w = -F.softplus(-w_raw) - 0.5
         k = self.key(xk)
         v = self.value(xv)

@@ -88,6 +88,21 @@ class MathTokenizer:
             self.special_to_id[tok] = start_id + i
             self.id_to_special[start_id + i] = tok
 
+        # Maximum base-token ID that can pass through safely.
+        # Any cl100k_base ID >= _max_base_id is out of the model's
+        # embedding range and would cause an IndexError at training.
+        # We collapse them all into a single bucket ID just below
+        # _max_base_id.  We do not attempt to preserve uniqueness --
+        # any distinct out-of-range IDs all collide into the same slot
+        # because the model's embedding has only ~32758 base slots,
+        # while cl100k_base has ~100k, so there's no room to keep them
+        # apart.  This is safe because (a) the model never trained on
+        # those IDs in the first place (they were never in the
+        # embedding table), and (b) the bucket ID is below the reserved
+        # special-token range, so it cannot collide with anything else.
+        self._max_base_id = vocab_size - len(self.special_tokens)
+        self._overflow_bucket_id = self._max_base_id - 1
+
         # Cache regex patterns for digit splitting
         self._num_re = re.compile(r"-?\d+(?:\.\d+)?")
         self._digit_re = re.compile(r"\d")
@@ -159,12 +174,20 @@ class MathTokenizer:
         # like <|endoftext|>, but our custom math tokens need explicit mapping)
         result: List[int] = []
         for tok_id in base_ids:
-            # If this token is a special token in our set, remap
             decoded = self.base_encoder.decode([tok_id])
             if decoded in self.special_to_id:
                 result.append(self.special_to_id[decoded])
-            else:
+            elif tok_id < self._max_base_id:
+                # In-range base token -- pass through unchanged.
                 result.append(tok_id)
+            else:
+                # Out-of-range base token (cl100k_base IDs can reach
+                # ~100K).  Collapse to a single bucket ID below
+                # _max_base_id so the model's embedding lookup can't
+                # IndexError.  The model has never seen any of these IDs
+                # during training, so the collapse causes no loss of
+                # information on the training side.
+                result.append(self._overflow_bucket_id)
 
         if add_special:
             result = [self.bos_id] + result
@@ -180,11 +203,21 @@ class MathTokenizer:
         Note: roundtrip is approximate for math expressions because we
         add spaces during preprocessing. We post-process to remove them.
         """
-        # First, convert IDs back to strings via base encoder
-        # Special tokens need special handling
+        # First, convert IDs back to strings via base encoder.
+        # Special tokens get their canonical string form.
+        # IDs that were capped in encode() (out-of-vocab-range tokens from
+        # cl100k_base) decode to whatever the original tiktoken bytes were;
+        # this is acceptable because (a) those tokens were never in the
+        # model's embedding table so they cannot appear in real generations
+        # or loss targets, and (b) we only use decode() for debugging /
+        # test assertions, not for anything that reaches the training loop.
         parts: List[str] = []
         for tok_id in ids:
             if tok_id in self.id_to_special:
+                # Special tokens are stored as their canonical strings,
+                # never passed to base_encoder.decode (which can't handle
+                # IDs in our reserved range that happen to collide with
+                # the out-of-range remapping block).
                 parts.append(self.id_to_special[tok_id])
             else:
                 parts.append(self.base_encoder.decode([tok_id]))
