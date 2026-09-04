@@ -169,9 +169,17 @@ def pretrain_step(
     input_ids = torch.from_numpy(batch["input_ids"]).long().to(cfg.device)
     labels = torch.from_numpy(batch["labels"]).long().to(cfg.device)
 
-    logits = model(input_ids)  # [seq_len, vocab]
-    shift_logits = logits[:-1, :].contiguous()
-    shift_labels = labels[1:].contiguous()
+    # M4 fix: ParquetDataset.iter_batches yields 1D arrays of shape
+    # [seq_len] (a single packed sequence per batch — effective batch
+    # size = 1). The model, however, expects [B, T] input. Add the
+    # batch dim so logits come back as [1, seq_len, vocab] and the
+    # shifting below is dimensionally consistent.
+    input_ids = input_ids.unsqueeze(0)
+    labels = labels.unsqueeze(0)
+
+    logits = model(input_ids)  # [B=1, seq_len, vocab]
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
 
     loss = F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
@@ -208,11 +216,11 @@ def evaluate_val(
         for i, batch in enumerate(val_iter):
             if i >= max_batches:
                 break
-            input_ids = torch.from_numpy(batch["input_ids"]).long().to(cfg.device)
-            labels    = torch.from_numpy(batch["labels"]).long().to(cfg.device)
-            logits = model(input_ids)
-            shift_logits = logits[:-1, :].contiguous()
-            shift_labels = labels[1:].contiguous()
+            input_ids = torch.from_numpy(batch["input_ids"]).long().to(cfg.device).unsqueeze(0)
+            labels    = torch.from_numpy(batch["labels"]).long().to(cfg.device).unsqueeze(0)
+            logits = model(input_ids)  # [1, seq_len, vocab]
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
