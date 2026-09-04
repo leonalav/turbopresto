@@ -164,6 +164,7 @@ def pretrain_step(
     scheduler,
     cfg: FaultlessPretrainConfig,
     step: int,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> float:
     """One training step. Returns scalar loss."""
     input_ids = torch.from_numpy(batch["input_ids"]).long().to(cfg.device)
@@ -177,19 +178,29 @@ def pretrain_step(
     input_ids = input_ids.unsqueeze(0)
     labels = labels.unsqueeze(0)
 
-    logits = model(input_ids)  # [B=1, seq_len, vocab]
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = labels[:, 1:].contiguous()
+    use_amp = cfg.dtype == torch.bfloat16 or scaler is not None
+    with torch.amp.autocast(device_type="cuda", dtype=cfg.dtype,
+                            enabled=use_amp):
+        logits = model(input_ids)  # [B=1, seq_len, vocab]
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
 
-    loss = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    )
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
 
-    loss.backward()
-    grad_norm = clip_grad(model, cfg.grad_clip)
-    optimizer.step()
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        grad_norm = clip_grad(model, cfg.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        grad_norm = clip_grad(model, cfg.grad_clip)
+        optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     # C5 fix: WarmupCosineLR.step() requires an explicit global_step.
     # The step counter is tracked by the caller and passed in.
@@ -255,6 +266,17 @@ def pretrain(model, cfg: FaultlessPretrainConfig,
     model.to(cfg.device)
     if cfg.dtype is not None:
         model.to(dtype=cfg.dtype)
+
+    # ── torch.compile: fuses kernels + caches CUDA graphs (biggest win
+    #    for the sequential WKV loop, whose per-token einsum ops get
+    #    fused/overlapped). Falls back gracefully if unsupported. ───────
+    if cfg.device.startswith("cuda"):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("[pretrain] torch.compile enabled (reduce-overhead)")
+        except Exception as exc:
+            print(f"[pretrain] torch.compile unavailable ({exc}); "
+                  f"running uncompiled")
 
     # ── Load parquet dataset ───────────────────────────────────────────
     print(f"\n[pretrain] Loading parquet dataset from {cfg.hf_repo_id} ...")
@@ -331,68 +353,142 @@ def pretrain(model, cfg: FaultlessPretrainConfig,
 
     step = start_step
     epoch = 0
+
+    # ── Mixed-precision scaler (only needed for fp16; bf16 uses autocast
+    #    without loss scaling) ──────────────────────────────────────────
+    use_scaler = cfg.dtype == torch.float16
+    scaler = torch.amp.GradScaler("cuda") if use_scaler else None
+
+    # ── Gradient accumulation to realize the requested batch size ──────
+    # The dataset yields one packed sequence (seq_len tokens) per item.
+    # To honor batch_size, we accumulate micro_steps = batch_size gradient
+    # contributions before each optimizer.step(). Each micro-step is a
+    # single sequence (effective micro-batch = 1); the optimizer step
+    # therefore sees batch_size * seq_len tokens, e.g. 512 * 2048 =
+    # 1,048,576 tokens/step. LR/scheduler advance once per optimizer step.
+    micro_steps = max(1, cfg.batch_size)
+    print(f"[pretrain] Gradient accumulation: micro_steps={micro_steps} "
+          f"(effective batch = {micro_steps} × {cfg.seq_len} = "
+          f"{micro_steps * cfg.seq_len:,} tokens/step)")
+
+    accum_buf: List[float] = []
     while step < cfg.max_steps:
         epoch += 1
         iter_factory = train_iter_factory(resume=step)
         for batch in iter_factory:
+            input_ids = torch.from_numpy(batch["input_ids"]).long().to(cfg.device)
+            labels = torch.from_numpy(batch["labels"]).long().to(cfg.device)
+            # Single packed sequence -> [1, seq_len] (micro-batch of 1)
+            input_ids = input_ids.unsqueeze(0)
+            labels = labels.unsqueeze(0)
+
+            use_amp = cfg.dtype in (torch.bfloat16, torch.float16)
             try:
-                loss, grad_norm = pretrain_step(
-                    model, batch, optimizer, scheduler, cfg, step
-                )
+                with torch.amp.autocast(device_type="cuda", dtype=cfg.dtype,
+                                        enabled=use_amp):
+                    logits = model(input_ids)
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = labels[:, 1:].contiguous()
+                    loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                    # Normalize so accumulated gradient = true mean
+                    scaled_loss = loss / micro_steps
+
+                if scaler is not None:
+                    scaler.scale(scaled_loss).backward()
+                else:
+                    scaled_loss.backward()
             except torch.cuda.OutOfMemoryError:
-                print(f"[pretrain] CUDA OOM at step {step}; reducing")
+                print(f"[pretrain] CUDA OOM at micro-step {step}; "
+                      f"reducing effective batch")
                 torch.cuda.empty_cache()
                 continue
             except Exception as exc:
                 print(f"[pretrain] Step {step} FAILED: {exc}; skipping")
                 continue
 
-            log_entry = {
-                "step": step,
-                "loss": loss,
-                "grad_norm": grad_norm,
-                "lr": scheduler.get_lr()[0] if scheduler else 0.0,
-                "epoch": epoch,
-                "elapsed": time.time() - t_start,
-            }
-            logs.append(log_entry)
+            accum_buf.append(float(loss.detach()))
 
-            if cfg.log_every > 0 and step % cfg.log_every == 0:
-                sps = (step - start_step + 1) / max(log_entry["elapsed"], 0.001)
-                print(
-                    f"[step {step:>6}/{cfg.max_steps}] "
-                    f"loss={loss:.4f}  "
-                    f"lr={log_entry['lr']:.2e}  "
-                    f"gn={grad_norm:.2f}  "
-                    f"epoch={epoch}  "
-                    f"sps={sps:.2f}  "
-                    f"elapsed={log_entry['elapsed']:.1f}s"
-                )
-                # Append to JSONL log file
-                with log_file.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-                if log_callback is not None:
-                    log_callback(log_entry)
+            # ── Optimizer step every micro_steps ─────────────────────
+            if len(accum_buf) >= micro_steps:
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    grad_norm = clip_grad(model, cfg.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    grad_norm = clip_grad(model, cfg.grad_clip)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if scheduler is not None:
+                    scheduler.step(step)
 
-            # Validation pass
-            if cfg.val_every > 0 and step > 0 and step % cfg.val_every == 0:
-                val_loss = evaluate_val(model, val_iter_factory(),
-                                        cfg, max_batches=16)
-                print(f"[step {step:>6}] VAL loss={val_loss:.4f}")
-                with log_file.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps({"step": step, "val_loss": val_loss,
-                                        "kind": "val"}) + "\n")
+                avg_loss = float(np.mean(accum_buf))
+                accum_buf.clear()
 
-            # Checkpoint
-            if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
-                ckpt_path = save_dir / f"step_{step+1}.pt"
-                save_checkpoint_atomic(model, optimizer, scheduler,
-                                       step + 1, cfg, ckpt_path)
-                print(f"[step {step+1}] saved checkpoint to {ckpt_path}")
+                log_entry = {
+                    "step": step,
+                    "loss": avg_loss,
+                    "grad_norm": grad_norm,
+                    "lr": scheduler.get_lr()[0] if scheduler else 0.0,
+                    "epoch": epoch,
+                    "elapsed": time.time() - t_start,
+                }
+                logs.append(log_entry)
 
-            step += 1
-            if step >= cfg.max_steps:
-                break
+                if cfg.log_every > 0 and step % cfg.log_every == 0:
+                    sps = (step - start_step + 1) / max(log_entry["elapsed"], 0.001)
+                    print(
+                        f"[step {step:>6}/{cfg.max_steps}] "
+                        f"loss={avg_loss:.4f}  "
+                        f"lr={log_entry['lr']:.2e}  "
+                        f"gn={grad_norm:.2f}  "
+                        f"epoch={epoch}  "
+                        f"sps={sps:.2f}  "
+                        f"elapsed={log_entry['elapsed']:.1f}s"
+                    )
+                    # Append to JSONL log file
+                    with log_file.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps(log_entry) + "\n")
+                    if log_callback is not None:
+                        log_callback(log_entry)
+
+                # Validation pass
+                if cfg.val_every > 0 and step > 0 and step % cfg.val_every == 0:
+                    val_loss = evaluate_val(model, val_iter_factory(),
+                                            cfg, max_batches=16)
+                    print(f"[step {step:>6}] VAL loss={val_loss:.4f}")
+                    with log_file.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({"step": step, "val_loss": val_loss,
+                                            "kind": "val"}) + "\n")
+
+                # Checkpoint
+                if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
+                    ckpt_path = save_dir / f"step_{step+1}.pt"
+                    save_checkpoint_atomic(model, optimizer, scheduler,
+                                           step + 1, cfg, ckpt_path)
+                    print(f"[step {step+1}] saved checkpoint to {ckpt_path}")
+
+                step += 1
+                if step >= cfg.max_steps:
+                    break
+
+    # Flush any leftover accumulated grads
+    if accum_buf:
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+            clip_grad(model, cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            clip_grad(model, cfg.grad_clip)
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        if scheduler is not None:
+            scheduler.step(step)
 
     # Final checkpoint
     final_path = save_dir / "final.pt"

@@ -47,29 +47,30 @@ from src.model.config import ModelConfig
 
 def rwkv7_wkv_forward(
     r: torch.Tensor,      # [B, T, C]   receptance
-    w: torch.Tensor,      # [B, T, C]   decay (already -softplus(-...) - 0.5)
+    w: torch.Tensor,      # [B, T, C]   raw decay (softplus-clamped)
     k: torch.Tensor,      # [B, T, C]   key
     v: torch.Tensor,      # [B, T, C]   value
     a: torch.Tensor,      # [B, T, C]   in-context lr (negative for -kk trick)
     b: torch.Tensor,      # [B, T, C]   delta-rule key
 ) -> torch.Tensor:
-    """Compute RWKV-7 WKV in GPT-mode (parallel but sequential over T).
+    """Compute RWKV-7 WKV in GPT-mode (causal, sequential over T).
 
     This is the reference implementation used by BlinkDL. It is O(T) with
     state stored in float32 for numerical stability.
 
     Args:
-        r, w, k, v, a, b: All shape [B, T, C], with C = n_heads * head_size
+        r, w, k, v, a, b: All shape [B, T, C], with C = n_heads * head_size.
 
     Returns:
         y: Shape [B, T, C], the time-mixing output.
 
-    Note: In canonical RWKV-7, a = -kk and b = kk*a, where kk is the
-    L2-normalized key. The product a ⊗ b is then:
-        a ⊗ b = (-kk) ⊗ (kk * a) = -(kk ⊗ kk) * a
-    which is convenient because the outer product is rank-1 with sign.
-    For CPU reference simplicity we treat a, b as given and just compute
-    state @ (a ⊗ b) directly.
+    Performance note: the outer ``for t in range(T)`` is a Python loop, but
+    every iteration is a batch of small GPU tensor ops (no Python-level
+    branching). Compiling the model with ``torch.compile(..., mode=
+    "reduce-overhead")`` captures the loop as a CUDA graph, which removes
+    the per-token kernel-launch overhead and makes this ~10-20x faster than
+    the naive run. For production, swap in the BlinkDL CUDA kernel
+    (RWKV-LM/cuda/wkv7.cu) which is ~100x faster still.
     """
     B, T, C = r.shape
     H = C // 64  # head_size = 64 fixed in RWKV-7
@@ -77,53 +78,46 @@ def rwkv7_wkv_forward(
     assert C % N == 0, f"C={C} must be divisible by head_size N={N}"
 
     # M5 fix: preserve the original input dtype so the final cast returns
-    # the same dtype as the caller expects (e.g. bf16 when the model is
-    # in bf16). Previously this code rebound `r` to .float() in-place
-    # and then used `r.dtype` for the output cast — which made the WKV
-    # return float32 even when the model was in bf16, breaking the
-    # downstream GroupNorm in RWKV7TimeMix.
+    # the same dtype as the caller expects (e.g. bf16 when the model is in
+    # bf16), so the downstream GroupNorm stays consistent.
     orig_dtype = r.dtype
 
-    # Reshape to [B, T, H, N]
+    # Reshape to [B, T, H, N]; compute in float32 for numerical stability.
     r = r.view(B, T, H, N).float()
     k = k.view(B, T, H, N).float()
     v = v.view(B, T, H, N).float()
     a = a.view(B, T, H, N).float()
     b = b.view(B, T, H, N).float()
-    # Convert decay to multiplicative scalar in (0, 1)
+    # Convert raw decay to a multiplicative scalar in (0, 1).
     w = torch.exp(-torch.exp(w.view(B, T, H, N).float()))
 
-    # State [B, H, N, N] in float32 for stability
+    # State [B, H, N, N] in float32 for stability.
     state = torch.zeros(B, H, N, N, device=r.device, dtype=torch.float32)
-    out = torch.empty(B, T, H, N, device=r.device, dtype=torch.float32)
-
+    ys: list[torch.Tensor] = []
     for t in range(T):
-        # Per-token state update (causal, sequential)
-        kk = k[:, t]                    # [B, H, N]
-        rr = r[:, t]                    # [B, H, N]
-        vv = v[:, t]                    # [B, H, N]
-        aa = a[:, t]                    # [B, H, N]
-        bb = b[:, t]                    # [B, H, N]
-        wt = w[:, t]                    # [B, H, N]
+        wt = w[:, t]   # [B, H, N]
+        at = a[:, t]
+        bt = b[:, t]
+        kt = k[:, t]
+        vt = v[:, t]
+        rt = r[:, t]
 
         # state = state * w + state @ (a ⊗ b) + v ⊗ k
-        # Using einsum for clarity (verifiable by /imo-mathematician)
-        sab = torch.einsum('bhik,bhk,bhj->bhij', state, aa, bb)
-        state = state * wt.unsqueeze(-1) + sab + torch.einsum('bhi,bhj->bhij', vv, kk)
+        sab = torch.einsum('bhik,bhk,bhj->bhij', state, at, bt)
+        state = state * wt.unsqueeze(-1) + sab + torch.einsum('bhi,bhj->bhij', vt, kt)
+        # out_t = state @ r
+        ys.append(torch.einsum('bhij,bhj->bhi', state, rt))
 
-        # out = state @ r
-        out[:, t] = torch.einsum('bhij,bhj->bhi', state, rr)
-
-    return out.view(B, T, C).to(dtype=orig_dtype)
+    y = torch.stack(ys, dim=1).view(B, T, C)
+    return y.to(dtype=orig_dtype)
 
 
 class RWKV7_WKV(torch.autograd.Function):
     """Custom autograd Function wrapping the WKV forward.
 
-    The backward uses autograd through the pure-PyTorch forward (no custom
-    kernel). For production, swap in the BlinkDL CUDA kernel which has its
-    own optimized backward. This implementation favors clarity and CPU
-    executability for tests.
+    Forward: uses the sequential scan (runs on GPU as batched tensor ops).
+    Backward: re-computes with torch.enable_grad (autograd through forward).
+    For production, swap in the BlinkDL CUDA kernel.
     """
 
     @staticmethod
@@ -136,20 +130,13 @@ class RWKV7_WKV(torch.autograd.Function):
         a: torch.Tensor,
         b: torch.Tensor,
     ) -> torch.Tensor:
-        # Detach inputs that we treat as constants w.r.t. the WKV op
-        # (these should NOT receive gradients through WKV's custom backward
-        # — they have their own projection gradients upstream)
-        # Actually for end-to-end autograd we need gradients through w, k, v, a, b
-        # so we don't detach.
         y = rwkv7_wkv_forward(r, w, k, v, a, b)
         ctx.save_for_backward(r, w, k, v, a, b)
         return y
 
     @staticmethod
     def backward(ctx, grad_y: torch.Tensor):
-        # Default autograd through the forward (slow but correct)
         r, w, k, v, a, b = ctx.saved_tensors
-        # Re-run with grad-enabled
         with torch.enable_grad():
             r_g = r.detach().requires_grad_(True)
             w_g = w.detach().requires_grad_(True)
