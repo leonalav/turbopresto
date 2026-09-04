@@ -76,6 +76,14 @@ def rwkv7_wkv_forward(
     N = 64
     assert C % N == 0, f"C={C} must be divisible by head_size N={N}"
 
+    # M5 fix: preserve the original input dtype so the final cast returns
+    # the same dtype as the caller expects (e.g. bf16 when the model is
+    # in bf16). Previously this code rebound `r` to .float() in-place
+    # and then used `r.dtype` for the output cast — which made the WKV
+    # return float32 even when the model was in bf16, breaking the
+    # downstream GroupNorm in RWKV7TimeMix.
+    orig_dtype = r.dtype
+
     # Reshape to [B, T, H, N]
     r = r.view(B, T, H, N).float()
     k = k.view(B, T, H, N).float()
@@ -106,7 +114,7 @@ def rwkv7_wkv_forward(
         # out = state @ r
         out[:, t] = torch.einsum('bhij,bhj->bhi', state, rr)
 
-    return out.view(B, T, C).to(dtype=r.dtype)
+    return out.view(B, T, C).to(dtype=orig_dtype)
 
 
 class RWKV7_WKV(torch.autograd.Function):
