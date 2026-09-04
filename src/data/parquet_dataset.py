@@ -45,14 +45,31 @@ def _get_hf_token() -> str:
 
 
 def list_parquet_files(repo_id: str, token: str) -> List[str]:
-    """List all parquet files under data/train/ in the HF repo."""
+    """List all parquet files in the HF repo.
+
+    Supports two layouts, in this order of preference:
+      1. **Root-level** parquet files (``chunk_0000.parquet``,
+         ``shard_001.parquet``, …) — current schema produced by
+         ``pretok.pretokenize`` and uploaded directly to the repo root.
+      2. **Legacy** ``data/train/*.parquet`` layout.
+
+    A non-zero root-level match always wins so a partially-migrated repo
+    doesn't pull in stale legacy chunks by accident.
+    """
     from huggingface_hub import HfApi
     api = HfApi(token=token)
     files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
-    return sorted(
-        f for f in files
-        if f.startswith("data/train/") and f.endswith(".parquet")
-    )
+
+    parquets = [f for f in files if f.endswith(".parquet")]
+    if not parquets:
+        return []
+
+    root_parquets = sorted(f for f in parquets if "/" not in f)
+    legacy_parquets = sorted(f for f in parquets if f.startswith("data/train/"))
+
+    if root_parquets:
+        return root_parquets
+    return legacy_parquets
 
 
 def download_parquet(repo_id: str, filename: str, token: str) -> Path:
@@ -67,18 +84,20 @@ def download_parquet(repo_id: str, filename: str, token: str) -> Path:
 
 
 def download_manifest(repo_id: str, token: str) -> Optional[Dict[str, Any]]:
-    """Download manifest.json (if present) from the HF repo."""
+    """Download ``manifest.json`` from the HF repo (root, then ``data/train/``)."""
     from huggingface_hub import hf_hub_download
-    try:
-        path = hf_hub_download(
-            repo_id=repo_id,
-            filename="data/train/manifest.json",
-            repo_type="dataset",
-            token=token,
-        )
-        return json.loads(Path(path).read_text())
-    except Exception:
-        return None
+    for filename in ("manifest.json", "data/train/manifest.json"):
+        try:
+            path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                repo_type="dataset",
+                token=token,
+            )
+            return json.loads(Path(path).read_text())
+        except Exception:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------

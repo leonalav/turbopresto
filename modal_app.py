@@ -30,7 +30,7 @@ app = modal.App("rwkv7-math-llm")
 
 # Image: CUDA 12.1 + PyTorch 2.1 + all dependencies
 IMAGE = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.debian_slim(python_version=(3, 11))
     .pip install(
         "torch>=2.1.0",
         "einops>=0.7.0",
@@ -41,6 +41,7 @@ IMAGE = (
         "safetensors>=0.4.0",
         "pyyaml>=6.0",
         "wandb>=0.15.0",
+        "pyarrow>=14.0.0",
     )
     # RWKV CUDA kernel — compile from source
     .run_commands(
@@ -51,7 +52,7 @@ IMAGE = (
 # GPU + compute: L40S @ 2 CPU, 4 GiB RAM (per user-specified profile, ~$2.33/hr)
 GPU_CONFIG = modal.gpu.L40S(count=1)
 CPU = 2
-MEM = 4096  # MiB
+MEM = 8192  # MiB
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +99,7 @@ def run_pretrain(
     resume_from: str = "",
     max_shards: int = 0,
     data_source: str = "parquet",  # "parquet" (HF Hub) or "stream" (original)
+    eos_id: Optional[int] = None,  # tokenizer.eos_id; marks doc boundaries
 ):
     """Run pretraining on A100.
 
@@ -105,6 +107,10 @@ def run_pretrain(
         data_source: "parquet" loads pretokenized data from
             leonidas123/valkmodel-data (recommended).  "stream" uses the
             original stream-from-HF tokenization pipeline.
+        eos_id: EOS token id used by ParquetDataset to mark document
+            boundaries so the model learns end-of-document. Must match the
+            tokenizer that produced the parquet chunks. If None,
+            ParquetDataset falls back to token 0 with a one-shot warning.
     """
     import os
     os.makedirs("/checkpoints/pretrain", exist_ok=True)
@@ -121,6 +127,14 @@ def run_pretrain(
     model = model.to(dtype=torch.bfloat16)
     model = model.cuda()
 
+    # Resolve eos_id: prefer the explicit CLI value, otherwise read from
+    # MathTokenizer so the user doesn't need to remember the id.
+    if eos_id is None:
+        from src.tokenizer.math_tokenizer import MathTokenizer
+        eos_id = MathTokenizer().eos_id
+        print(f"[run_pretrain] eos_id not provided; using "
+              f"MathTokenizer.eos_id = {eos_id}")
+
     import wandb
     wandb.init(
         project="rwkv7-math-llm",
@@ -132,6 +146,7 @@ def run_pretrain(
             "lr": lr,
             "total_params": cfg.total_params(),
             "data_source": data_source,
+            "eos_id": eos_id,
         },
     )
 
@@ -152,6 +167,7 @@ def run_pretrain(
             dtype=torch.bfloat16,
             resume_from=resume_from or None,
             max_shards=max_shards or None,
+            eos_id=eos_id,
         )
         logs = pretrain_parquet(model, fp_cfg)
     else:
