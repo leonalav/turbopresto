@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import sys
 import time
@@ -191,30 +192,163 @@ def stream_synthetic_texts(size: int, seed: int) -> Iterator[Dict[str, str]]:
     print(f"[synthetic] Generated {size} examples.")
 
 
+def _download_jsonl_resumable(
+    url: str,
+    dst: Path,
+    *,
+    max_retries: int = 12,
+    chunk_size: int = 4 * 1024 * 1024,
+) -> Path:
+    """Download a large JSONL file from HF Hub with byte-level resume.
+
+    Why: HF's CDN routinely truncates 10 GB single-stream downloads after a
+    few MB ("peer closed connection without sending complete message body").
+    `load_dataset(streaming=True)` and `hf_hub_download` both treat that as
+    a fatal retry-bounded failure and re-download from byte 0.
+
+    This helper uses HTTP `Range` requests so a truncation only costs the
+    last few chunks, and backs off exponentially with jitter when the CDN
+    throttles us.
+    """
+    import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    session = requests.Session()
+    # urllib3 retry handles transient HTTP-level errors (503, 504, etc.)
+    retry = Retry(
+        total=5,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET", "HEAD"),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_maxsize=4)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    # Resolve final URL (HF redirects to a CDN bucket)
+    head = session.head(url, allow_redirects=True, timeout=30)
+    head.raise_for_status()
+    final_url = head.url
+    total = int(head.headers.get("Content-Length", 0))
+
+    # Existing partial file?
+    pos = dst.stat().st_size if dst.exists() else 0
+    if pos == total and total > 0:
+        print(f"[download] {dst.name}: already complete ({total / 1e9:.2f} GB)")
+        return dst
+
+    if pos > 0 and total > 0:
+        print(f"[download] {dst.name}: resuming at {pos / 1e9:.2f} GB "
+              f"of {total / 1e9:.2f} GB")
+
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            headers = {"Range": f"bytes={pos}-"} if pos > 0 else {}
+            r = session.get(
+                final_url, headers=headers, stream=True, timeout=60
+            )
+            r.raise_for_status()
+
+            mode = "ab" if pos > 0 else "wb"
+            t0 = time.time()
+            with open(dst, mode) as f:
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        pos += len(chunk)
+            elapsed = time.time() - t0
+            rate = pos / elapsed / 1e6 if elapsed > 0 else 0
+            # Server may have closed early without telling us; verify size.
+            actual = dst.stat().st_size
+            if total > 0 and actual < total:
+                raise requests.exceptions.ContentDecodingError(
+                    f"short read: got {actual / 1e6:.1f} MB, "
+                    f"expected {total / 1e6:.1f} MB"
+                )
+            print(f"[download] {dst.name}: done in {elapsed:.1f}s "
+                  f"({rate:.1f} MB/s)")
+            return dst
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.ContentDecodingError) as e:
+            attempt += 1
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"Failed to download {dst.name} after {max_retries} "
+                    f"retries at {pos / 1e9:.2f} GB. Last error: {e}"
+                ) from e
+            # Cap exponential backoff at 60s, add jitter
+            sleep = min(60.0, 2 ** attempt) + random.uniform(0, 2)
+            print(f"[download] {dst.name}: stream cut at {pos / 1e9:.2f} GB "
+                  f"({e.__class__.__name__}). Retrying in {sleep:.1f}s "
+                  f"[{attempt}/{max_retries}]")
+            time.sleep(sleep)
+
+    raise RuntimeError(f"Unreachable: download loop exited for {dst.name}")
+
+
+def _iter_jsonl_records(path: Path) -> Iterator[Dict[str, str]]:
+    """Stream JSONL records from a fully-downloaded local file."""
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
+
+
 def stream_swallow_texts(max_rows: int) -> Iterator[Dict[str, str]]:
     """Stream math problems from tokyotech-llm/swallow-math.
+
+    The raw dataset ships as two ~10 GB JSONL files.  HF's CDN routinely
+    truncates such large single-stream downloads.  We use a resumable
+    HTTP Range downloader to local disk first, then stream from disk —
+    no per-row network calls, no truncation thrash.
 
     Raises RuntimeError on failure (caller must handle).
     Yields {"source": "swallow", "text": <problem + solution>}.
     """
-    from datasets import load_dataset
-    print(f"[swallow] Loading stream (cap={max_rows:,} docs) ...")
-    ds = load_dataset(
-        "tokyotech-llm/swallow-math",
-        split="train",
-        streaming=True,
+    from huggingface_hub import hf_hub_download
+
+    cache_dir = Path(os.environ.get(
+        "SWALLOW_CACHE_DIR",
+        str(Path.home() / ".cache" / "resonanc" / "swallow-math")
+    ))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    base = (
+        "https://huggingface.co/datasets/tokyotech-llm/swallow-math/"
+        "resolve/main"
     )
+    shards = [
+        ("train-00001-of-00002.jsonl", f"{base}/train-00001-of-00002.jsonl"),
+        ("train-00002-of-00002.jsonl", f"{base}/train-00002-of-00002.jsonl"),
+    ]
+
+    print(f"[swallow] Resumable download into {cache_dir}")
+    for filename, url in shards:
+        dst = cache_dir / filename
+        _download_jsonl_resumable(url, dst)
+
+    print(f"[swallow] Streaming records (cap={max_rows:,} docs) ...")
     count = 0
-    for row in ds:
-        problem = row.get("problem", "")
-        solution = row.get("solution", "")
-        if not problem or not solution:
-            continue
-        text = f"Problem: {problem}\n\nSolution:\n{solution}"
-        yield {"source": "swallow", "text": text}
-        count += 1
-        if count >= max_rows:
-            break
+    for filename, _ in shards:
+        for row in _iter_jsonl_records(cache_dir / filename):
+            problem = row.get("problem", "")
+            solution = row.get("solution", "")
+            if not problem or not solution:
+                continue
+            text = f"Problem: {problem}\n\nSolution:\n{solution}"
+            yield {"source": "swallow", "text": text}
+            count += 1
+            if count >= max_rows:
+                print(f"[swallow] Streamed {count:,} rows.")
+                return
     print(f"[swallow] Streamed {count:,} rows.")
 
 

@@ -5,7 +5,8 @@
 .env.local
 .env.tmp
 graphify-out
-
+prefetch_cache
+.gitignore
 
 
 
