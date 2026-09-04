@@ -1,8 +1,8 @@
 """Pretokenization pipeline for RWKV-7 math model (50M parameters).
 
 Fetches data from:
-  - tokyotech-llm/swallow-math    (Japanese math problems, 40% of corpus)
-  - HuggingFaceFW/fineweb (10BT)  (general English web text, 30% of corpus)
+  - issdandavis/UltraData-Math  (L2-preview, forum math w/ LaTeX, 40% of corpus)
+  - HuggingFaceFW/fineweb (10BT) (general English web text, 30% of corpus)
   - ajibawa-2023/Python-Code-Large (Python source files, Python 3 filtered, 30%)
 
 ────────────────────────────────────────────────────────────────────────────
@@ -13,9 +13,14 @@ Compute-optimal sizing (per Chinchilla / Hoffmann et al. 2022):
 ────────────────────────────────────────────────────────────────────────────
 
 Target split: 40% math / 30% general / 30% Python code
-  - tokyotech-llm/swallow-math  → 40% × 2.0B = 800M tokens
-  - FineWeb-10BT                 → 30% × 2.0B = 600M tokens
-  - ajibawa-2023/Python-Code...  → 30% × 2.0B = 600M tokens
+  - issdandavis/UltraData-Math → 40% × 2.0B = 800M tokens
+  - FineWeb-10BT               → 30% × 2.0B = 600M tokens
+  - ajibawa-2023/Python-Code...→ 30% × 2.0B = 600M tokens
+
+UltraData-Math (L2-preview): 4 parquet shards are pre-downloaded to
+~/.cache/resonanc/ultradata-math/ (~1.6 GB, ~20 min at 1.4 MB/s).
+Rows are shuffled in-memory and quality-filtered (quality_label >= 3).
+4 shards ≈ 400K rows ≈ 200M chars ≈ 40M tokens.
 
 Python code is filtered to Python 3 syntax (rejects `print "foo"`,
 `class X(object):`, `u'...'`, `apply()`, `exec '...'`).
@@ -50,7 +55,7 @@ HF_TOKEN: read from the environment variable (e.g. `export HF_TOKEN=hf_xxx`
 on bash, `$env:HF_TOKEN='hf_xxx'` on PowerShell) or, as a fallback, from a
 .env file at the repo root.  The token is ONLY needed for the upload step
 — tokenization and parquet writing work without it (the three source
-datasets — tokyotech-llm/swallow-math, HuggingFaceFW/fineweb,
+datasets — issdandavis/UltraData-Math, HuggingFaceFW/fineweb,
 ajibawa-2023/Python-Code-Large — are public and streamed without auth).
 If HF_TOKEN is unset (or --no-upload is passed), the run skips upload and
 keeps parquet chunks in ./parquet_chunks/.
@@ -150,10 +155,10 @@ assert abs(MATH_RATIO + GENERAL_RATIO + PYTHON_CODE_RATIO - 1.0) < 1e-9
 # per integer of reasonable length).  If a caller enables digit_split=True
 # these estimates must be re-measured.
 AVG_TOKENS = {
-    "swallow":     25_000,   # long reasoning traces
-    "fineweb":        700,    # typical web paragraph
-    "python_code":    700,    # one Python file snippet
-    "synthetic":       20,    # arithmetic sentence
+    "ultradata_math": 4_000,   # ~500 chars/row, 5 chars/token ≈ 100 tokens/row
+    "fineweb":           700,   # typical web paragraph
+    "python_code":       700,   # one Python file snippet
+    "synthetic":          20,   # arithmetic sentence
 }
 
 
@@ -300,6 +305,192 @@ def _iter_jsonl_records(path: Path) -> Iterator[Dict[str, str]]:
             if not line:
                 continue
             yield json.loads(line)
+
+
+# ---------------------------------------------------------------------------
+# UltraData-Math streamer (parquet-based, partial pre-download)
+# ---------------------------------------------------------------------------
+
+class UltraDataMathStreamer:
+    """Stream rows from issdandavis/UltraData-Math (L2-preview) by downloading
+    a configurable number of parquet shards to local disk and reading from them.
+
+    Why parquet: the dataset ships as 138 parquet shards (~415 MB each).
+    Downloading even 3-4 shards gives 300-400K rows = ~200M chars =
+    ~40M tokens — more than enough for the math compute-optimal budget.
+    HF's CDN is too slow for the full 128 GB; streaming via the rows API
+    (max 100 rows/request) is too chatty (160K+ sequential HTTP calls).
+
+    The tradeoff: ~20 min to download 4 shards at 1.4 MB/s, then instant
+    iteration from local disk.  This is the same pattern as swallow-math.
+
+    Config used: UltraData-Math-L2-preview
+    Schema      : {content: string, quality_label: int}
+    Source      : forum posts with LaTeX math (quality labels 1-5)
+    """
+
+    DATASET   = "issdandavis/UltraData-Math"
+    CONFIG    = "UltraData-Math-L2-preview"
+    # Parquet files within the config (138 total, each ~100K rows)
+    # We download a prefix of this list — caller controls how many via
+    # `n_shards_to_cache`.
+    PARQUET_FILES: List[str] = [
+        f"data/UltraData-Math-L2-preview/UltraData-Math-L2-part-{i:05d}-of-00138.parquet"
+        for i in range(1, 139)
+    ]
+
+    def __init__(
+        self,
+        *,
+        cache_dir: Path | None = None,
+        n_shards_to_cache: int = 4,
+        quality_threshold: int = 3,
+        seed: int = 42,
+    ):
+        """
+        Args:
+            cache_dir       : where to store downloaded parquet shards.
+                              Defaults to ~/.cache/resonanc/ultradata-math/
+            n_shards_to_cache: how many shards to pre-download.
+                              4 shards ≈ 400K rows ≈ 200M chars ≈ 40M tokens.
+                              Each shard is ~415 MB on disk.
+            quality_threshold: minimum quality_label to include (1-5).
+                              Default 3 filters out low-quality forum noise.
+            seed            : RNG seed for shuffling the row order.
+        """
+        if cache_dir is None:
+            cache_dir = Path(os.environ.get(
+                "ULTRADATA_CACHE_DIR",
+                str(Path.home() / ".cache" / "resonanc" / "ultradata-math")
+            ))
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.n_shards = n_shards_to_cache
+        self.quality_threshold = quality_threshold
+        self._rng = random.Random(seed)
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def ensure_cached(self) -> None:
+        """Download parquet shards if not already in cache_dir.
+
+        Idempotent: skips shards that already exist and are the right size.
+        Prints progress as each shard completes.
+        """
+        for i, remote_path in enumerate(self.PARQUET_FILES[:self.n_shards]):
+            local_path = self.cache_dir / remote_path.replace("/", "_")
+            expected_bytes = self._shard_size(i)
+
+            # Skip if already downloaded (with basic size sanity check)
+            if local_path.exists() and local_path.stat().st_size >= expected_bytes * 0.9:
+                print(f"  [ultradata] shard {i+1}/{self.n_shards}: "
+                      f"already cached ({local_path.stat().st_size / 1e6:.0f} MB)")
+                continue
+
+            url = (
+                f"https://huggingface.co/datasets/{self.DATASET}/resolve/main/"
+                f"{remote_path}"
+            )
+            print(f"  [ultradata] shard {i+1}/{self.n_shards}: "
+                  f"downloading {remote_path} ...")
+            _download_jsonl_resumable(url, local_path)
+            actual = local_path.stat().st_size
+            print(f"  [ultradata] shard {i+1}/{self.n_shards}: "
+                  f"done ({actual / 1e6:.0f} MB)")
+
+    def stream(self, max_docs: int | None = None) -> Iterator[Dict[str, str]]:
+        """Yield rows from the cached parquet shards.
+
+        Each shard is read into memory (pyarrow, ~400 MB peak), shuffled
+        in-memory, and yielded until max_docs is hit.
+
+        Yields {"source": "ultradata_math", "text": <content>}.
+        """
+        import pyarrow.parquet as pq
+
+        all_rows: List[Dict] = []
+        for i, remote_path in enumerate(self.PARQUET_FILES[:self.n_shards]):
+            local_path = self.cache_dir / remote_path.replace("/", "_")
+            if not local_path.exists():
+                raise RuntimeError(
+                    f"Shard {i+1} not found at {local_path}. "
+                    "Call ensure_cached() first."
+                )
+            table = pq.read_table(str(local_path))
+            df = table.to_pandas()
+            for _, row in df.iterrows():
+                all_rows.append({
+                    "content": row["content"],
+                    "quality_label": row["quality_label"],
+                })
+
+        # Shuffle once before yielding
+        self._rng.shuffle(all_rows)
+
+        yielded = 0
+        for row in all_rows:
+            if max_docs is not None and yielded >= max_docs:
+                break
+            # Quality filter: only include rows at or above threshold
+            if row["quality_label"] < self.quality_threshold:
+                continue
+            yield {
+                "source": "ultradata_math",
+                "text": row["content"],
+            }
+            yielded += 1
+
+    # ── Internal helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _shard_size(shard_idx: int) -> int:
+        """Estimated uncompressed size of shard `shard_idx` in bytes.
+
+        Based on the first shard (415 MB).  Later shards may be slightly
+        smaller or larger depending on row density.
+        """
+        return 415_000_000  # ~415 MB
+
+    @staticmethod
+    def total_shards() -> int:
+        return len(UltraDataMathStreamer.PARQUET_FILES)
+
+
+def stream_ultradata_texts(max_rows: int) -> Iterator[Dict[str, str]]:
+    """Stream math texts from issdandavis/UltraData-Math (L2-preview).
+
+    Downloads 4 parquet shards to ~/.cache/resonanc/ultradata-math/
+    (~1.6 GB, ~20 min at 1.4 MB/s) on first run, then streams from disk.
+    Rows are shuffled in-memory and quality-filtered (quality_label >= 3).
+
+    Yields {"source": "ultradata_math", "text": <content>}.
+    """
+    cache_dir = Path(os.environ.get(
+        "ULTRADATA_CACHE_DIR",
+        str(Path.home() / ".cache" / "resonanc" / "ultradata-math")
+    ))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    streamer = UltraDataMathStreamer(
+        cache_dir=cache_dir,
+        n_shards_to_cache=4,
+        quality_threshold=3,
+        seed=42,
+    )
+
+    total_shards = streamer.total_shards()
+    print(f"[ultradata] Caching {streamer.n_shards}/{total_shards} parquet shards "
+          f"({streamer.n_shards * 415} MB) → {cache_dir}")
+    streamer.ensure_cached()
+    print(f"[ultradata] Streaming records (cap={max_rows:,} docs, quality>=3) ...")
+
+    count = 0
+    for record in streamer.stream(max_docs=max_rows):
+        yield record
+        count += 1
+        if count >= max_rows:
+            break
+    print(f"[ultradata] Streamed {count:,} rows.")
 
 
 def stream_swallow_texts(max_rows: int) -> Iterator[Dict[str, str]]:
@@ -461,7 +652,7 @@ def stream_python_code_texts(max_rows: int) -> Iterator[Dict[str, str]]:
 @dataclass
 class PlanOutput:
     """Final token targets per source after compute-optimal allocation."""
-    swallow_tokens:   int
+    ultradata_tokens:   int
     fineweb_tokens:   int
     python_code_tokens: int
     synthetic_docs:   int
@@ -477,15 +668,15 @@ def compute_adaptive_plan(
     """
     print("\n[plan] Computing compute-optimal targets ...")
 
-    target_swallow     = int(TARGET_TOTAL_TOKENS * MATH_RATIO)       # 800M
+    target_ultradata  = int(TARGET_TOTAL_TOKENS * MATH_RATIO)       # 800M
     target_fineweb    = int(TARGET_TOTAL_TOKENS * GENERAL_RATIO)    # 600M
     target_python     = int(TARGET_TOTAL_TOKENS * PYTHON_CODE_RATIO) # 600M
 
-    print(f"[plan] Targets: swallow={target_swallow:,}  "
+    print(f"[plan] Targets: ultradata={target_ultradata:,}  "
           f"FineWeb={target_fineweb:,}  python_code={target_python:,}")
 
     return PlanOutput(
-        swallow_tokens=target_swallow,
+        ultradata_tokens=target_ultradata,
         fineweb_tokens=target_fineweb,
         python_code_tokens=target_python,
         synthetic_docs=cfg.max_synthetic,
@@ -576,7 +767,11 @@ def _encode_batch(records: List[Dict]) -> List[Dict]:
     out = []
     for r in records:
         text = r["text"]
-        ids = tok.encode(text, add_special=False)
+        try:
+            ids = tok.encode(text, add_special=False)
+        except Exception:
+            # Skip records that fail to tokenize rather than crashing the worker
+            continue
         out.append({
             "source":   r["source"],
             "text":     text,
@@ -607,7 +802,7 @@ def parallel_tokenize_iterator(
     counts: Dict[str, int] = {src: 0 for src in source_caps}
 
     ctx = mp.get_context("fork")
-    pool = ctx.Pool(processes=workers, maxtasksperchild=64)
+    pool = ctx.Pool(processes=workers)
 
     def _batches():
         batch: List[Dict] = []
@@ -620,14 +815,17 @@ def parallel_tokenize_iterator(
             yield batch
 
     try:
+        n_yielded = 0
+        t_start = time.time()
         for result_batch in pool.imap_unordered(
-            _encode_batch, _batches(), chunksize=1
+            _encode_batch, _batches(), chunksize=8
         ):
             for record in result_batch:
                 source = record["source"]
                 # Sources not in target plan (e.g. synthetic) bypass caps.
                 if source not in targets:
                     yield record
+                    n_yielded += 1
                     continue
                 if accumulated[source] >= targets[source]:
                     continue
@@ -636,8 +834,22 @@ def parallel_tokenize_iterator(
                 accumulated[source] += record["n_tokens"]
                 counts[source] += 1
                 yield record
+                n_yielded += 1
+                # Progress: log every 50k records and per-source milestones
+                if n_yielded % 50_000 == 0:
+                    elapsed = time.time() - t_start
+                    rate = n_yielded / elapsed if elapsed > 0 else 0
+                    src_summary = "  ".join(
+                        f"{s}={accumulated.get(s,0)/1e6:.0f}M"
+                        for s in sorted(accumulated)
+                    )
+                    print(f"  [tokenize] {n_yielded:,} records "
+                          f"({rate:.0f} rec/s, {elapsed:.0f}s) | {src_summary}")
+    except Exception as e:
+        print(f"\n[tokenize] ERROR in pool: {e}")
+        raise
     finally:
-        pool.close()
+        pool.terminate()
         pool.join()
 
 
@@ -757,23 +969,23 @@ def _prefetch_to_disk(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     caps = {
-        "swallow":     cfg.max_swallow,
-        "python_code": cfg.max_python_code,
-        "fineweb":     docs_for_tokens(plan.fineweb_tokens, "fineweb"),
+        "ultradata_math": cfg.max_swallow,
+        "python_code":    cfg.max_python_code,
+        "fineweb":        docs_for_tokens(plan.fineweb_tokens, "fineweb"),
     }
 
     sources: List[Tuple[str, int]] = [
-        ("synthetic",   cfg.max_synthetic),
-        ("swallow",     caps["swallow"]),
-        ("python_code", caps["python_code"]),
-        ("fineweb",     caps["fineweb"]),
+        ("synthetic",      cfg.max_synthetic),
+        ("ultradata_math", cfg.max_swallow),
+        ("python_code",    cfg.max_python_code),
+        ("fineweb",        caps["fineweb"]),
     ]
 
     iterators = {
-        "synthetic":   lambda n: stream_synthetic_texts(n, seed=42),
-        "swallow":     lambda n: stream_swallow_texts(n),
-        "python_code": lambda n: stream_python_code_texts(n),
-        "fineweb":     lambda n: stream_fineweb_texts(plan.fineweb_tokens),
+        "synthetic":      lambda n: stream_synthetic_texts(n, seed=42),
+        "ultradata_math": lambda n: stream_ultradata_texts(n),
+        "python_code":    lambda n: stream_python_code_texts(n),
+        "fineweb":        lambda n: stream_fineweb_texts(plan.fineweb_tokens),
     }
 
     paths: Dict[str, Path] = {}
@@ -873,19 +1085,19 @@ def upload_to_hub(
         "total_chunks":  len(chunk_paths),
         "target_total_tokens": TARGET_TOTAL_TOKENS,
         "split_ratios":  {
-            "swallow":     MATH_RATIO,
-            "fineweb":     GENERAL_RATIO,
-            "python_code": PYTHON_CODE_RATIO,
+            "ultradata_math": MATH_RATIO,
+            "fineweb":        GENERAL_RATIO,
+            "python_code":    PYTHON_CODE_RATIO,
         },
         "plan": {
-            "swallow_tokens":     plan.swallow_tokens,
+            "ultradata_tokens":    plan.ultradata_tokens,
             "fineweb_tokens":     plan.fineweb_tokens,
             "python_code_tokens": plan.python_code_tokens,
             "synthetic_docs":    plan.synthetic_docs,
         },
         "avg_tokens_per_doc": AVG_TOKENS,
         "sources": {
-            "swallow":     "tokyotech-llm/swallow-math (train split)",
+            "ultradata_math": "issdandavis/UltraData-Math (L2-preview, quality>=3, 4 shards ≈ 400K docs)",
             "fineweb":     "HuggingFaceFW/fineweb (sample-10BT)",
             "python_code": "ajibawa-2023/Python-Code-Large (Python 3 filtered, max 500k docs)",
             "synthetic":   "SyntheticMathDataset (seed=42, max_digits=3)",
@@ -952,14 +1164,14 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
 
     # 4. Build source iterators + target dict + cap dict
     targets = {
-        "swallow":     plan.swallow_tokens,
-        "fineweb":     plan.fineweb_tokens,
-        "python_code": plan.python_code_tokens,
+        "ultradata_math": plan.ultradata_tokens,
+        "fineweb":        plan.fineweb_tokens,
+        "python_code":    plan.python_code_tokens,
     }
     caps = {
-        "swallow":     cfg.max_swallow,
-        "python_code": cfg.max_python_code,
-        "fineweb":     docs_for_tokens(plan.fineweb_tokens, "fineweb"),
+        "ultradata_math": cfg.max_swallow,
+        "python_code":    cfg.max_python_code,
+        "fineweb":        docs_for_tokens(plan.fineweb_tokens, "fineweb"),
     }
     print(f"\n[plan] Document caps: {caps}")
     print(f"[plan] Workers: {cfg.workers} "
@@ -976,8 +1188,8 @@ def run_tokenize(cfg: TokenizeConfig) -> None:
     def all_sources():
         # Synthetic first — fully local, always available
         yield from _disk_iter(shards["synthetic"])
-        # Swallow-math
-        yield from _disk_iter(shards["swallow"])
+        # UltraData-Math (quality-filtered forum math)
+        yield from _disk_iter(shards["ultradata_math"])
         # Python code (already Python-3 filtered)
         yield from _disk_iter(shards["python_code"])
         # FineWeb — already cut to target
